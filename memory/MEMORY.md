@@ -1,0 +1,2 @@
+- [Проект ПРОСТОР — хакатон](project_prostor_hackathon.md) — контекст: два кейса, MVP, дедлайны, роли жюри.
+- [Векторное хранилище — pgvector](project_vector_storage_pgvector.md) — почему pgvector, а не in-memory или Qdrant.

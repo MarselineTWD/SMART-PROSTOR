@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: prostor-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-prostor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-prostor}
+      POSTGRES_DB: ${POSTGRES_DB:-prostor}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-prostor} -d ${POSTGRES_DB:-prostor}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-intfloat/multilingual-e5-small}
+    container_name: prostor-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-prostor}:${POSTGRES_PASSWORD:-prostor}@postgres:5432/${POSTGRES_DB:-prostor}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-intfloat/multilingual-e5-small}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
+      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
+      CORS_ORIGINS: '["http://localhost:8080","http://127.0.0.1:8080","http://localhost:5173"]'
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - hf_cache:/opt/hf-cache
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: prostor-frontend
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+
+volumes:
+  postgres_data:
+  hf_cache:

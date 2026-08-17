@@ -1,12 +1,45 @@
-from dataclasses import dataclass
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-@dataclass(frozen=True)
-class Settings:
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     app_name: str = "PROSTOR MVP Backend"
     app_version: str = "0.1.0"
     api_prefix: str = "/api"
 
+    database_url: str = Field(
+        default="postgresql+asyncpg://prostor:prostor@localhost:5433/prostor",
+        alias="DATABASE_URL",
+    )
 
-settings = Settings()
+    embedding_model_name: str = Field(
+        default="intfloat/multilingual-e5-small",
+        alias="EMBEDDING_MODEL_NAME",
+    )
+    embedding_dim: int = Field(default=384, alias="EMBEDDING_DIM")
+    embedding_device: str = Field(default="cpu", alias="EMBEDDING_DEVICE")
 
+    cors_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:8080",
+        ],
+        alias="CORS_ORIGINS",
+    )
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
