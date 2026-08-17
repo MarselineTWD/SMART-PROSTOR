@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prostor-backend"
+version = "0.1.0"
+description = "MVP backend for the PROSTOR hackathon solution"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.116.0,<1.0.0",
+    "uvicorn[standard]>=0.35.0,<1.0.0",
+    "python-docx>=1.1.2,<2.0.0",
+    "openpyxl>=3.1.0,<4.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backend*"]
