@@ -21,10 +21,54 @@
 
 ## Запуск
 
+### Через Docker Compose
+
+Рекомендуемый способ для запуска на другом устройстве:
+
+```bash
+git clone https://github.com/MarselineTWD/SMART-PROSTOR.git
+cd SMART-PROSTOR
+docker compose up --build
+```
+
+Если репозиторий уже скачан, достаточно выполнить из корня проекта:
+
+```bash
+docker compose up --build
+```
+
+После запуска:
+
+- интерфейс: http://localhost:5173
+- backend через frontend proxy: http://localhost:5173/api/health
+- backend напрямую: http://localhost:8000/api/health
+
+Остановка:
+
+```bash
+docker compose down
+```
+
+Сгенерированные пакеты документов сохраняются во внутреннем Docker volume `prostor_outputs`.
+
+### Локально без Docker
+
+Backend:
+
 ```bash
 pip install -e .
 uvicorn backend.app.main:app --reload
 ```
+
+Frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Локальный frontend использует относительный путь `/api` и Vite proxy на `http://127.0.0.1:8000`.
 
 ## Основные эндпоинты
 
