@@ -10,11 +10,21 @@ class AdditionalServiceOption(BaseModel):
     min_cost_without_vat: float
 
 
+class TeamMember(BaseModel):
+    grade: str
+    role: str
+    rate_rub_per_hour: int
+    allocation: float
+    hours: int
+    cost_rub: float
+
+
 class AdditionalServiceCost(BaseModel):
     product_id: str
     name: str
     estimated_days: int
     cost_without_vat: float
+    team: list[TeamMember] = []
 
 
 class RoadmapStage(BaseModel):
@@ -51,6 +61,8 @@ class ContractorEstimate(BaseModel):
     role_count: int
     average_fte: float
     base_day_rate_rub: float
+    team: list[TeamMember] = []
+    total_hours: int = 0
     cost_without_vat: float
     vat_rate: float
     vat_amount: float

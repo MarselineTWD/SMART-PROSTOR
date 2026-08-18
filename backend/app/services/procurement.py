@@ -1,9 +1,14 @@
-"""Справочные данные ПРОСТОР (из xlsx -> БД) и расчёт сроков/роадмапа.
+"""Справочные данные ПРОСТОР (из xlsx -> БД) и расчёт сроков/стоимости.
 
 Данные читаются из committed-файла ``backend/app/data/procurement_seed.json``
 (тот же, которым засеивается БД миграцией 0003), поэтому расчёт работает и без
-БД. По заполненному ТЗ модуль определяет продукт и по расчётам стоимости (РС)
-строит для каждого подрядчика оценку срока и роадмап этапов.
+БД. По заполненному ТЗ модуль определяет продукт, для каждого подрядчика
+восстанавливает исторический РС и считает индикативную стоимость и календарь
+этапов.
+
+Расчёт стоимости — по «командам» ролей. В выгрузке ставки идут по L2–L5
+(грейд специалиста). Мы держим таблицу ставок руб/час по грейдам и синтезируем
+команду для продукта: по одному человеку на каждый уникальный грейд.
 """
 from __future__ import annotations
 
@@ -15,20 +20,38 @@ from pathlib import Path
 
 SEED_PATH = Path(__file__).resolve().parents[1] / "data" / "procurement_seed.json"
 
-# Числовая ставка присутствует только в эталонном «Приложении 3. РС.xlsx»:
-# 1 000 руб./рабочий день. В каталожной выгрузке перечислены роли и единицы,
-# но сами договорные ставки намеренно отсутствуют. Поэтому денежная оценка
-# показывается как индикативная и не подменяет согласованный РС.
-BASE_DAY_RATE_RUB = 1_000.0
-VAT_RATE = 0.22
-FTE_PER_ROLE = 0.9
+
+# ---- Ставки по грейду ------------------------------------------------------
+# Синтетические, но правдоподобные для нефтесервисного контракта. Данные
+# приведены в рублях/час без НДС. Реальные договорные ставки в выгрузке
+# ПРОСТОР отсутствуют, поэтому цифры служат ориентиром — не заменяют
+# согласованный РС.
+GRADE_RATES_RUB_PER_HOUR: dict[str, int] = {
+    "L2": 2_500,   # младший специалист
+    "L3": 4_500,   # ведущий / старший специалист
+    "L4": 7_500,   # эксперт / главный специалист
+    "L5": 12_000,  # руководитель проекта / партнёр
+}
+DEFAULT_GRADE = "L3"
+# Полная занятость каждого специалиста на проекте. Меньше 1.0 — реалистично:
+# в нефтесервисной проектной работе один эксперт распределяется на несколько
+# заказов одновременно.
+GRADE_ALLOCATION = {"L2": 0.7, "L3": 0.6, "L4": 0.4, "L5": 0.3}
+HOURS_PER_WORKDAY = 8
+VAT_RATE = 0.20
+WORKDAYS_PER_CALENDAR = 5 / 7
+
 COST_DISCLAIMER = (
-    "Индикативная оценка: подрядчик, длительность и роли взяты из XLSX ПРОСТОР; "
-    "базовая ставка 1 000 руб./раб. день — из примера Приложения 3. РС. "
-    "В выгрузке договорные суммы отсутствуют, перед заказом ставку нужно уточнить."
+    "Индикативная оценка: длительность и состав ролей — из XLSX ПРОСТОР; "
+    "ставки руб/час подобраны по грейду специалиста (L2 — 2 500, L3 — 4 500, "
+    "L4 — 7 500, L5 — 12 000). Договорные суммы в исходных данных отсутствуют, "
+    "перед заказом ставки должны быть подтверждены в РС."
 )
 
+
 _TOKEN_RE = re.compile(r"[а-яёa-z0-9]+")
+_GRADE_RE = re.compile(r"\bL([2-5])\b", re.IGNORECASE)
+
 # Помогает связать шаблоны ТЗ (демо) с реальными продуктами выгрузки.
 _ALIASES = {
     "птд": "проектно технический документ",
@@ -53,6 +76,34 @@ def _pdate(value: str | None) -> date | None:
         return date.fromisoformat(str(value)[:10])
     except ValueError:
         return None
+
+
+def _grade_of(role_name: str) -> str:
+    """Классифицирует роль по грейду L2/L3/L4/L5 по имени."""
+    if not role_name:
+        return DEFAULT_GRADE
+    match = _GRADE_RE.search(role_name)
+    if match:
+        return f"L{match.group(1)}"
+    low = role_name.lower()
+    if any(k in low for k in ("директор", "партнер", "партнёр", "руководител")):
+        return "L5"
+    if any(k in low for k in ("эксперт", "главный")):
+        return "L4"
+    if any(k in low for k in ("старш", "ведущ", "консультант")):
+        return "L3"
+    return DEFAULT_GRADE
+
+
+def _rate_for(role_name: str) -> int:
+    return GRADE_RATES_RUB_PER_HOUR[_grade_of(role_name)]
+
+
+def _short_role_label(role_name: str) -> str:
+    """Убирает суффикс L2/L3/L4/L5 и возвращает читабельную область работ."""
+    if not role_name:
+        return "Специалист"
+    return _GRADE_RE.sub("", role_name).strip(" -–—") or role_name
 
 
 class ProcurementService:
@@ -81,7 +132,66 @@ class ProcurementService:
             self.stages_by_calc[s["calc_id"]].append(s)
         self._loaded = True
 
-    # --- Вспомогательные расчёты ---------------------------------------------
+    # --- Команда и стоимость ------------------------------------------------
+
+    def _team_composition(self, product_id: str) -> list[dict]:
+        """Собирает представительную команду продукта: по одному человеку
+        на каждый уникальный грейд из имеющихся расценок.
+        """
+        roles = self.roles_by_product.get(product_id) or set()
+        by_grade: dict[str, str] = {}
+        # Сохраняем первую встреченную роль для каждого грейда — обычно
+        # это осмысленное направление ("Геология и разработка L3" > просто L3).
+        for role in sorted(roles):
+            grade = _grade_of(role)
+            by_grade.setdefault(grade, role)
+        if not by_grade:
+            # Продукт без расценок — минимальная команда L3.
+            by_grade = {DEFAULT_GRADE: "Специалист"}
+        # Гарантируем, что в команде есть хотя бы L3 (эксперт по умолчанию).
+        by_grade.setdefault(DEFAULT_GRADE, "Специалист")
+        team: list[dict] = []
+        for grade in ("L2", "L3", "L4", "L5"):
+            if grade in by_grade:
+                team.append({
+                    "grade": grade,
+                    "role": _short_role_label(by_grade[grade]),
+                    "rate_rub_per_hour": GRADE_RATES_RUB_PER_HOUR[grade],
+                    "allocation": GRADE_ALLOCATION[grade],
+                })
+        return team
+
+    def _cost_breakdown(self, product_id: str, workdays: int) -> dict:
+        team = self._team_composition(product_id)
+        rows: list[dict] = []
+        total_hours = 0
+        total_cost = 0.0
+        for member in team:
+            hours = int(round(workdays * HOURS_PER_WORKDAY * member["allocation"]))
+            cost = hours * member["rate_rub_per_hour"]
+            total_hours += hours
+            total_cost += cost
+            rows.append({
+                "grade": member["grade"],
+                "role": member["role"],
+                "rate_rub_per_hour": member["rate_rub_per_hour"],
+                "allocation": member["allocation"],
+                "hours": hours,
+                "cost_rub": round(cost, 2),
+            })
+        cost_without_vat = round(total_cost, 2)
+        vat = round(cost_without_vat * VAT_RATE, 2)
+        return {
+            "team": rows,
+            "total_hours": total_hours,
+            "workdays": workdays,
+            "cost_without_vat": cost_without_vat,
+            "vat_rate": VAT_RATE,
+            "vat_amount": vat,
+            "cost_with_vat": round(cost_without_vat + vat, 2),
+        }
+
+    # --- Длительность и календарь -------------------------------------------
 
     def _span_days(self, calc: dict) -> int:
         start, end = _pdate(calc.get("start_date")), _pdate(calc.get("end_date"))
@@ -132,14 +242,7 @@ class ProcurementService:
         stage_names: list[str],
         plan_start: str | None = None,
     ) -> tuple[int, list[dict]]:
-        """Распределяет срок подрядчика только по этапам пользовательского ТЗ.
-
-        XLSX используется для оценки общей длительности подрядчика. Названия и
-        количество этапов берутся из сохранённого ТЗ, а не из исторического РС.
-        Если число исторических и пользовательских этапов совпадает, сохраняем
-        исторические пропорции; иначе делим срок поровну и явно не выдумываем
-        отсутствующую в исходных данных детализацию.
-        """
+        """Распределяет срок подрядчика по этапам пользовательского ТЗ."""
         names = [str(name).strip() for name in stage_names if str(name).strip()]
         if not names:
             return self._span_days(calc), []
@@ -184,16 +287,16 @@ class ProcurementService:
 
     def _cost_for_calc(self, product_id: str, calc: dict) -> dict:
         total = self._span_days(calc)
-        workdays = max(round(total * 5 / 7), 1)
-        role_count = max(len(self.roles_by_product.get(product_id, [])), 1)
-        average_fte = round(max(role_count * FTE_PER_ROLE, 1.0), 2)
-        cost_without_vat = round(workdays * average_fte * BASE_DAY_RATE_RUB, 2)
+        workdays = max(round(total * WORKDAYS_PER_CALENDAR), 1)
+        breakdown = self._cost_breakdown(product_id, workdays)
         return {
             "estimated_days": total,
             "workdays": workdays,
-            "role_count": role_count,
-            "average_fte": average_fte,
-            "cost_without_vat": cost_without_vat,
+            "cost_without_vat": breakdown["cost_without_vat"],
+            "vat_amount": breakdown["vat_amount"],
+            "cost_with_vat": breakdown["cost_with_vat"],
+            "team": breakdown["team"],
+            "total_hours": breakdown["total_hours"],
         }
 
     def _additional_services(self, product_id: str, company_ids: set[str]) -> list[dict]:
@@ -225,7 +328,7 @@ class ProcurementService:
     # --- Публичное API --------------------------------------------------------
 
     def list_products(self) -> list[dict]:
-        """Продукты, для которых есть расчёты стоимости (можно оценить сроки)."""
+        """Продукты, для которых есть расчёты стоимости."""
         self._load()
         out = []
         for pid, calcs in self.calcs_by_product.items():
@@ -268,10 +371,11 @@ class ProcurementService:
         ]
 
         companies = []
-        product_roles = sorted(self.roles_by_product.get(product_id, []))
-        role_count = max(len(product_roles), 1)
         for cid, comp_calcs in by_company.items():
-            rep = max(comp_calcs, key=lambda c: (len(self.stages_by_calc.get(c["calc_id"], [])), self._span_days(c)))
+            rep = max(
+                comp_calcs,
+                key=lambda c: (len(self.stages_by_calc.get(c["calc_id"], [])), self._span_days(c)),
+            )
             spans = [self._span_days(c) for c in comp_calcs]
             total, roadmap = (
                 self._build_tz_roadmap(rep, roadmap_stages, plan_start)
@@ -280,10 +384,9 @@ class ProcurementService:
             )
             info = self.companies.get(cid, {})
             contract = self.contracts.get(rep.get("contract_id") or "", {})
-            workdays = max(round(total * 5 / 7), 1)
-            average_fte = round(max(role_count * FTE_PER_ROLE, 1.0), 2)
-            cost_without_vat = round(workdays * average_fte * BASE_DAY_RATE_RUB, 2)
-            base_cost_without_vat = cost_without_vat
+            workdays = max(round(total * WORKDAYS_PER_CALENDAR), 1)
+            base_breakdown = self._cost_breakdown(product_id, workdays)
+            base_cost_without_vat = base_breakdown["cost_without_vat"]
             selected_services = []
             for additional_id in selected_additional_ids:
                 candidate_calcs = [
@@ -294,12 +397,17 @@ class ProcurementService:
                     continue
                 additional_calc = min(candidate_calcs, key=self._span_days)
                 additional_cost = self._cost_for_calc(additional_id, additional_calc)
-                additional_name = self.products.get(additional_id, {}).get("name") or additional_calc.get("product_name") or additional_id
+                additional_name = (
+                    self.products.get(additional_id, {}).get("name")
+                    or additional_calc.get("product_name")
+                    or additional_id
+                )
                 selected_services.append({
                     "product_id": additional_id,
                     "name": additional_name,
                     "estimated_days": additional_cost["estimated_days"],
                     "cost_without_vat": additional_cost["cost_without_vat"],
+                    "team": additional_cost["team"],
                 })
             additional_cost_without_vat = round(sum(item["cost_without_vat"] for item in selected_services), 2)
             cost_without_vat = round(base_cost_without_vat + additional_cost_without_vat, 2)
@@ -326,9 +434,17 @@ class ProcurementService:
                 "stage_count": len(roadmap),
                 "stages": roadmap,
                 "workdays": workdays,
-                "role_count": role_count,
-                "average_fte": average_fte,
-                "base_day_rate_rub": BASE_DAY_RATE_RUB,
+                "team": base_breakdown["team"],
+                "total_hours": base_breakdown["total_hours"],
+                # Совместимость со старой схемой ContractorEstimate:
+                "role_count": len(base_breakdown["team"]),
+                "average_fte": round(
+                    sum(member["allocation"] for member in base_breakdown["team"]), 2
+                ),
+                "base_day_rate_rub": (
+                    round(base_cost_without_vat / (workdays * HOURS_PER_WORKDAY), 2)
+                    if workdays else 0
+                ),
                 "cost_without_vat": cost_without_vat,
                 "vat_rate": VAT_RATE,
                 "vat_amount": vat_amount,
@@ -415,6 +531,69 @@ class ProcurementService:
                 estimate["tz_title"] = getattr(tz, "title", "") or getattr(tz, "template_name", "")
         return {"query": query, "matched": matches[0] if matches else None,
                 "alternatives": matches[1:], "estimate": estimate}
+
+    def top_contractors_for_tz(self, tz, top: int = 3) -> dict:
+        """Топ-N подрядчиков под ТЗ с готовыми данными для диаграммы Ганта.
+
+        Возвращает не сравнительную выборку по цене, а «шорт-лист под тендер»:
+        первый — самый быстрый, второй — оптимум цена/срок, третий — самый
+        рейтинговый (для сложных объектов). У каждого — календарь этапов,
+        разложенный от `plan_start`, и полная стоимость с НДС.
+        """
+        analysis = self.estimate_for_tz(tz)
+        estimate = analysis.get("estimate") or {}
+        companies: list[dict] = list(estimate.get("companies") or [])
+        if not companies:
+            return {
+                "tz_id": getattr(tz, "id", None),
+                "matched_product": analysis.get("matched"),
+                "contractors": [],
+                "plan_start": None,
+                "cost_disclaimer": COST_DISCLAIMER,
+            }
+
+        # Три оси: быстрее всех / дешевле всех / рейтинг.
+        by_speed = min(companies, key=lambda c: c["estimated_days"])
+        by_price = min(companies, key=lambda c: c["cost_without_vat"])
+        by_rating = max(companies, key=lambda c: (c.get("rating") or 0, -c["cost_without_vat"]))
+
+        picks: list[dict] = []
+        seen: set[str] = set()
+        for label, candidate in (
+            ("fastest", by_speed),
+            ("cheapest", by_price),
+            ("top_rated", by_rating),
+        ):
+            if candidate["company_id"] in seen:
+                continue
+            seen.add(candidate["company_id"])
+            picks.append({**candidate, "recommendation_reason": label})
+            if len(picks) >= top:
+                break
+
+        # Добор до `top` — по возрастанию стоимости.
+        if len(picks) < top:
+            for candidate in sorted(companies, key=lambda c: c["cost_without_vat"]):
+                if candidate["company_id"] in seen:
+                    continue
+                seen.add(candidate["company_id"])
+                picks.append({**candidate, "recommendation_reason": "value"})
+                if len(picks) >= top:
+                    break
+
+        plan_start = (getattr(tz, "requisites", {}) or {}).get("start_date")
+        return {
+            "tz_id": getattr(tz, "id", None),
+            "tz_title": getattr(tz, "title", "") or getattr(tz, "template_name", ""),
+            "matched_product": {
+                "id": estimate.get("product_id"),
+                "name": estimate.get("product_name"),
+            },
+            "plan_start": plan_start,
+            "cost_disclaimer": COST_DISCLAIMER,
+            "vat_rate": VAT_RATE,
+            "contractors": picks,
+        }
 
 
 procurement_service = ProcurementService()

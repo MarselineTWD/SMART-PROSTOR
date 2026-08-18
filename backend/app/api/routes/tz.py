@@ -28,12 +28,14 @@ from backend.app.schemas.tz import (
 from backend.app.core.config import settings
 from backend.app.services.assistant import assistant_service
 from backend.app.services.documents import document_export_service
+from backend.app.services.procurement import procurement_service
 from backend.app.services.tz_chat import tz_chat_service
 from backend.app.services.storage import DOCX_MIME, get_storage_service
 from backend.app.services.tz_generator import tz_generator
 from backend.app.services.tz_repository import tz_repository
 from backend.app.services.tz_templates import tz_template_service
 from backend.app.services.tz_validation import tz_validation_service
+from backend.app.schemas.contractors import ContractorAnalysisResponse
 
 
 logger = logging.getLogger(__name__)
@@ -194,6 +196,22 @@ async def validate_document(doc_id: str) -> TZValidationResult:
     document.ready_score = validation.ready_score
     await tz_repository.update(document)
     return validation
+
+
+@router.get("/{doc_id}/contractors", response_model=ContractorAnalysisResponse)
+async def contractors_for_document(doc_id: str, top: int = 3) -> ContractorAnalysisResponse:
+    """Топ-N подрядчиков под сохранённое ТЗ.
+
+    Возвращает шорт-лист (по умолчанию 3) с готовыми данными для диаграммы
+    Ганта (этапы с датами) и полной стоимостью в рублях, посчитанной по
+    ставкам грейдов L2–L5 и составу команды продукта. Рекомендация
+    объясняется полем `recommendation_reason`: fastest / cheapest / top_rated.
+    """
+    document = await tz_repository.get(doc_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="ТЗ не найдено")
+    analysis = procurement_service.top_contractors_for_tz(document, top=top)
+    return ContractorAnalysisResponse(**analysis)
 
 
 @router.post("/{doc_id}/switch-template", response_model=TZDocumentResponse)
