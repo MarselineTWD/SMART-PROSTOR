@@ -7,6 +7,25 @@ class AssistantService:
         context = payload.context or {}
         draft = context.get("draft") or {}
         product = context.get("selected_product") or {}
+        tz = context.get("tz") or {}
+
+        if ("дополн" in message or "заполн" in message) and ("тз" in message or "раздел" in message or tz or draft):
+            return (
+                "Дополню пустые разделы ТЗ по текущим данным. "
+                "Нажмите «Дополнить с ИИ» — заполню недостающие разделы, уже заполненные не трону."
+            )
+
+        if "сгенерир" in message or "полностью" in message or "сделай тз" in message or "напиши тз" in message:
+            return (
+                "Соберу ТЗ целиком по выбранному шаблону и введённым данным. "
+                "Нажмите «Сгенерировать полностью» — перезапишу все разделы связным текстом."
+            )
+
+        if "шаблон" in message or "переключ" in message:
+            return (
+                "Можно переключить шаблон ТЗ в конструкторе: доступны ПТД, ОПЗ, концепты "
+                "геологии/обустройства/развития/заканчивания, сопровождение и универсальная форма."
+            )
 
         if "уточ" in message or "вопрос" in message:
             return "Уточните объект, цель, срок, исходные данные и субподряд."
@@ -33,7 +52,7 @@ class AssistantService:
                 return "Нажмите «Сформировать ТЗ»."
             return "Сначала выберите продукт."
 
-        return "Могу найти услугу, проверить риски или кратко собрать ТЗ."
+        return "Могу найти услугу, проверить риски, дополнить или полностью сгенерировать ТЗ."
 
 
 assistant_service = AssistantService()
