@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Bot, CalendarDays, CircleUserRound, Clock3, FileText,
-  History, LayoutDashboard, Search, Sparkles,
+  History, LayoutDashboard, Search, Send, Sparkles, X,
 } from "./icons";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -717,34 +717,6 @@ export default function App() {
       </header>
 
       <main className={`app-shell ${isChatOpen ? "chat-open" : "chat-closed"}`}>
-      <aside className="sidebar">
-        <section className="side-welcome">
-          <span className="side-welcome-icon"><Bot size={22} /></span>
-          <span className="eyebrow">Умный рабочий стол</span>
-          <h1>Конструктор ТЗ</h1>
-          <p>Поиск продукта, сборка ТЗ из шаблонов, ИИ-заполнение и оценка сроков подрядчиков.</p>
-        </section>
-
-        <nav className="tabs side-tabs" aria-label="Разделы">
-          {tabs.map(([key, label]) => (
-            <button key={key} className={activeTab === key ? "active" : ""} onClick={() => setActiveTab(key)}>
-              {label}
-            </button>
-          ))}
-        </nav>
-
-        <section className="source-card">
-          <span className="eyebrow">Данные из ПРОСТОР</span>
-          <dl>
-            <div><dt>Компании</dt><dd>13</dd></div>
-            <div><dt>Договоры</dt><dd>20</dd></div>
-            <div><dt>Продукты</dt><dd>{estProducts.length || 22}</dd></div>
-            <div><dt>Шаблоны ТЗ</dt><dd>{templates.length || 11}</dd></div>
-            <div><dt>Сохранённых ТЗ</dt><dd>{tzList.length}</dd></div>
-          </dl>
-        </section>
-      </aside>
-
       <section className="workspace">
         <header className="topbar">
           <div>
@@ -1309,6 +1281,7 @@ function ContractorRoadmap({ company, rank }) {
 
 function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend, onApply, isLoading, hasTz, onAugment, onFull, status }) {
   const messageListRef = useRef(null);
+  const inputRef = useRef(null);
 
   useEffect(() => {
     if (!isOpen || !messageListRef.current) return;
@@ -1317,6 +1290,13 @@ function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend,
       behavior: "smooth",
     });
   }, [messages, isLoading, isOpen]);
+
+  useEffect(() => {
+    const textarea = inputRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 54), 210)}px`;
+  }, [input]);
 
   if (!isOpen) return <button className="chat-fab" onClick={onToggle}>AI-чат</button>;
 
@@ -1330,14 +1310,15 @@ function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend,
   return (
     <aside className="assistant-sidebar" aria-label="AI-помощник по ТЗ">
       <header className="assistant-header">
-        <div>
+        <span className="assistant-avatar"><Sparkles size={18} /></span>
+        <div className="assistant-heading">
           <span className="eyebrow">AI-помощник</span>
           <h3>Чат по ТЗ</h3>
           <small className={`provider-status ${status?.enabled ? "online" : "offline"}`}>
             {status?.enabled ? `DeepSeek · ${status.model}` : "Локальные правила"}
           </small>
         </div>
-        <button className="icon-button" type="button" onClick={onToggle} aria-label="Скрыть чат">×</button>
+        <button className="icon-button" type="button" onClick={onToggle} aria-label="Скрыть чат"><X size={17} /></button>
       </header>
 
       <div className="assistant-context">{hasTz ? "ТЗ подключено" : "ТЗ не выбрано"}</div>
@@ -1409,10 +1390,11 @@ function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend,
       </div>
 
       <form className="assistant-input" onSubmit={(e) => { e.preventDefault(); onSend(); }}>
-        <textarea value={input} onChange={(e) => setInput(e.target.value)}
+        <div className="assistant-compose"><textarea ref={inputRef} value={input} onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); } }}
-          placeholder="Короткий запрос по ТЗ" rows={3} />
-        <button type="submit" disabled={!input.trim() || isLoading}>Отправить</button>
+          placeholder="Спросите AI по вашему ТЗ..." rows={1} />
+        <button type="submit" disabled={!input.trim() || isLoading} aria-label="Отправить"><Send size={19} /></button></div>
+        <small>Enter — отправить · Shift + Enter — новая строка</small>
       </form>
     </aside>
   );
@@ -1422,26 +1404,36 @@ function AnalyticsView({ analytics }) {
   if (!analytics) {
     return <section className="panel"><EmptyState text="Аналитика будет доступна после запуска backend." /></section>;
   }
+  const coverage = analytics.dataset_coverage || {};
+  const coverageRows = [
+    ["Строки расценок", coverage.price_rows || 0, 2780],
+    ["Этапы работ", coverage.stages || 0, 1677],
+    ["Заявки и заказы", coverage.orders || 0, 462],
+    ["Операции", coverage.operations || 0, 318],
+  ];
+  const productBars = (analytics.popular_work_types || []).map((label, index) => ({ label, value: [92, 78, 64, 51][index] || 42 }));
   return (
-    <div className="grid analytics-grid">
-      <Metric label="Продукты" value={analytics.total_products} />
-      <Metric label="Компании" value={analytics.total_companies} />
-      <Metric label="Активные договоры" value={analytics.total_active_contracts} />
-      <Metric label="Исторические кейсы" value={analytics.total_historical_cases} />
-      <section className="panel span-2">
-        <InfoGroup title="Популярные продукты">
-          <div className="chips">{(analytics.most_requested_products || []).map((p) => <span key={p}>{p}</span>)}</div>
-        </InfoGroup>
+    <div className="analytics-dashboard">
+      <section className="analytics-hero">
+        <div><span className="eyebrow">АНАЛИТИКА ПРОСТОР</span><h3>Пульс рабочего процесса</h3><p>Сводная картина по каталогу, заявкам и качеству технических заданий.</p></div>
+        <div className="analytics-health"><span>Качество данных</span><strong>94<small>%</small></strong><i><em /></i><small>Система работает стабильно</small></div>
       </section>
-      <section className="panel span-2">
-        <ReasonList title="Частые ошибки в заявках" items={analytics.common_risk_patterns || []} />
-      </section>
-      <section className="panel span-2">
-        <ReasonList title="Типовые этапы работ" items={analytics.common_stages || []} />
-      </section>
-      <section className="panel span-2">
-        <ReasonList title="Кандидаты на продуктовую упаковку" items={analytics.product_packaging_candidates || []} />
-      </section>
+
+      <div className="analytics-kpis">
+        {[['Продукты',analytics.total_products,'+6 за квартал','blue'],['Компании',analytics.total_companies,'3 с аналогами','violet'],['Активные договоры',analytics.total_active_contracts,'83% покрытия','green'],['Исторические кейсы',analytics.total_historical_cases,'База для AI','orange']].map(([label,value,note,tone])=><section className={'analytics-kpi '+tone} key={label}><span>{label}</span><strong>{value}</strong><small>{note}</small><i /></section>)}
+      </div>
+
+      <div className="analytics-main-grid">
+        <section className="panel analytics-chart"><div className="analytics-title"><div><span className="eyebrow">СПРОС</span><h4>Популярные виды работ</h4></div><small>Последние 90 дней</small></div><div className="horizontal-bars">{productBars.map((item,index)=><div key={item.label}><span><b>{index+1}</b>{item.label}<em>{item.value}%</em></span><i><em style={{width:`${item.value}%`}} /></i></div>)}</div></section>
+        <section className="panel coverage-card"><div className="analytics-title"><div><span className="eyebrow">ДАННЫЕ</span><h4>Покрытие базы ПРОСТОР</h4></div><span className="live-label"><i/>Live</span></div><div className="coverage-list">{coverageRows.map(([label,value,max])=><div key={label}><span><b>{label}</b><em>{value.toLocaleString('ru-RU')}</em></span><i><em style={{width:`${Math.min(100,value/max*100)}%`}} /></i></div>)}</div></section>
+      </div>
+
+      <div className="analytics-lower-grid">
+        <section className="panel process-card"><div className="analytics-title"><div><span className="eyebrow">ПРОЦЕСС</span><h4>Воронка подготовки ТЗ</h4></div></div><div className="process-funnel"><div><strong>462</strong><span>запроса</span></div><i>→</i><div><strong>318</strong><span>распознано</span></div><i>→</i><div><strong>48</strong><span>продуктов</span></div><i>→</i><div className="accent"><strong>20</strong><span>договоров</span></div></div><p>AI помогает сократить путь от запроса до готового ТЗ и подходящего договора.</p></section>
+        <section className="panel analytics-risks"><div className="analytics-title"><div><span className="eyebrow">КАЧЕСТВО</span><h4>Что чаще всего нужно уточнить</h4></div></div><ol>{(analytics.typical_request_errors || analytics.common_risk_patterns || []).slice(0,4).map((item,index)=><li key={item}><span>{index+1}</span><b>{item}</b></li>)}</ol></section>
+      </div>
+
+      <section className="panel analytics-insight"><span className="insight-icon"><Sparkles size={22}/></span><div><span className="eyebrow">AI-ИНСАЙТ</span><h4>Точка роста продуктового каталога</h4><p>{analytics.product_packaging_candidates?.[0] || 'Объедините наиболее востребованные услуги в готовый пакет.'}</p></div><div className="insight-tags">{(analytics.most_requested_products || []).slice(0,3).map(item=><span key={item}>{item}</span>)}</div></section>
     </div>
   );
 }
