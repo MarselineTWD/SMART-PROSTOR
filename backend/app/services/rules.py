@@ -105,11 +105,6 @@ class RulesService:
 
         documents = [
             DraftDocument(kind="tz", status="ready" if ready_score >= 70 else "planned"),
-            DraftDocument(kind="calendar_plan", status="planned"),
-            DraftDocument(
-                kind="cost_estimate",
-                status="ready" if draft.input_data.separate_subcontract_estimate else "planned",
-            ),
         ]
 
         draft.risks = risks

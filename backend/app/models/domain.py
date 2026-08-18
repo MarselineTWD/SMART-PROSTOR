@@ -1,4 +1,5 @@
-from typing import Literal
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -126,4 +127,61 @@ class RequestDraft(BaseModel):
     ready_score: int = Field(default=0, ge=0, le=100)
     documents: list[DraftDocument] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+
+# --- Шаблоны и документы ТЗ ---------------------------------------------------
+
+SectionSource = Literal["template", "manual", "ai"]
+TZStatus = Literal["draft", "ready", "archived"]
+
+
+class TZField(BaseModel):
+    key: str
+    label: str
+    placeholder: str = ""
+    required: bool = False
+
+
+class TZTemplateSection(BaseModel):
+    key: str
+    title: str
+    hint: str = ""
+    ai_fillable: bool = True
+
+
+class TZTemplate(BaseModel):
+    key: str
+    name: str
+    product_id: str | None = None
+    description: str = ""
+    stage_presets: list[str] = Field(default_factory=list)
+    fields: list[TZField] = Field(default_factory=list)
+    sections: list[TZTemplateSection] = Field(default_factory=list)
+
+
+class TZDocumentSection(BaseModel):
+    key: str
+    title: str
+    content: str = ""
+    source: SectionSource = "template"
+
+
+class TZDocument(BaseModel):
+    id: str
+    template_key: str
+    template_name: str = ""
+    product_id: str | None = None
+    title: str = ""
+    object_name: str | None = None
+    customer_name: str | None = None
+    executor_name: str | None = None
+    contract_name: str | None = None
+    status: TZStatus = "draft"
+    ready_score: int = Field(default=0, ge=0, le=100)
+    requisites: dict[str, Any] = Field(default_factory=dict)
+    input_data: DraftInputData = Field(default_factory=DraftInputData)
+    sections: list[TZDocumentSection] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 

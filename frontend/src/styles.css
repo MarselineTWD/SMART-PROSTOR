@@ -11,3 +11,90 @@
   .chat-input{margin:12px 14px 0;min-height:43px}
   .form-layout .assistant{top:92px;height:calc(100vh - 116px);min-height:480px}
 }
+
+/* --- Конструктор ТЗ, Мои ТЗ, Роадмап ------------------------------------- */
+select {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--text);
+  padding: 12px 14px;
+  border-radius: 8px;
+  min-height: 46px;
+}
+select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37, 111, 99, 0.14); }
+
+.ai-instruction { margin-top: 14px; }
+
+.section-editor { display: grid; gap: 12px; margin-top: 18px; }
+.section-card {
+  display: grid; gap: 8px; padding: 14px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft);
+}
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.section-head h5 { margin: 0; font-size: 0.98rem; color: #33413c; }
+.section-actions { display: flex; justify-content: flex-end; }
+.section-actions button { min-height: 38px; padding: 8px 12px; }
+
+.source-badge {
+  display: inline-flex; align-items: center; min-height: 26px; padding: 4px 9px;
+  border-radius: 999px; font-size: 0.78rem; font-weight: 700; background: #eef2f0; color: #33413c;
+}
+.source-badge.ai { background: var(--accent-soft); color: var(--accent-strong); }
+.source-badge.manual { background: #fff7ea; color: var(--warning); }
+.source-badge.template { background: #eef2f0; color: var(--muted); }
+
+.tz-list { display: grid; gap: 12px; margin-top: 8px; }
+.tz-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft);
+}
+.tz-card-main { display: grid; gap: 4px; min-width: 0; }
+.tz-card-main small { color: var(--muted); }
+.tz-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.tz-meta span {
+  display: inline-flex; align-items: center; min-height: 26px; padding: 3px 9px;
+  border-radius: 999px; background: #eef2f0; color: #33413c; font-size: 0.82rem; font-weight: 650;
+}
+.status-badge.good { background: var(--accent-soft); color: var(--accent-strong); }
+.status-badge.warn { background: #fff7ea; color: var(--warning); }
+.status-badge.bad { background: #fff0ef; color: var(--danger); }
+.tz-card-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.tz-card-actions button { min-height: 40px; padding: 8px 12px; }
+
+.roadmap-list { display: grid; gap: 14px; margin-top: 10px; }
+.contractor-card {
+  display: grid; gap: 10px; padding: 16px;
+  border: 1px solid var(--line); border-radius: 12px; background: #fff;
+}
+.contractor-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.contractor-head small { display: block; color: var(--muted); margin-top: 2px; }
+.contractor-est { text-align: right; white-space: nowrap; }
+.contractor-est strong { color: var(--accent-strong); font-size: 1.15rem; }
+.contractor-est small { display: block; color: var(--muted); }
+
+.roadmap-track {
+  display: flex; width: 100%; height: 30px; border-radius: 8px; overflow: hidden;
+  border: 1px solid var(--line); background: var(--panel-soft);
+}
+.roadmap-seg {
+  display: flex; align-items: center; justify-content: center; min-width: 14px;
+  color: #fff; font-size: 0.74rem; font-weight: 700; overflow: hidden; border-right: 1px solid #fff;
+}
+.roadmap-seg span { padding: 0 4px; }
+.roadmap-seg.c0 { background: #256f63; }
+.roadmap-seg.c1 { background: #355c9a; }
+.roadmap-seg.c2 { background: #b46b1f; }
+.roadmap-seg.c3 { background: #6a4c93; }
+.roadmap-seg.c4 { background: #4a8f4e; }
+
+.roadmap-stages { margin: 4px 0 0; padding-left: 18px; display: grid; gap: 4px; color: var(--muted); }
+.roadmap-stages li { display: flex; justify-content: space-between; gap: 12px; }
+.roadmap-stages .rs-name { color: var(--text); }
+.roadmap-stages .rs-days { color: var(--accent-strong); font-weight: 650; white-space: nowrap; }
+
+@media (max-width: 760px) {
+  .tz-card { flex-direction: column; align-items: stretch; }
+  .contractor-head { flex-direction: column; }
+  .contractor-est { text-align: left; }
+}

@@ -24,9 +24,9 @@ def evaluate_draft(payload: DraftEvaluationRequest) -> DraftResponse:
 
 @router.post("/export")
 def export_draft(payload: DraftEvaluationRequest) -> FileResponse:
-    archive_path = document_export_service.export_zip(payload.draft)
+    docx_path = document_export_service.export_from_draft(payload.draft)
     return FileResponse(
-        path=archive_path,
-        filename=archive_path.name,
-        media_type="application/zip",
+        path=docx_path,
+        filename=docx_path.name,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )

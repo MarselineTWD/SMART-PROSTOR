@@ -22,7 +22,6 @@ RUN pip install \
     "fastapi>=0.116.0,<1.0.0" \
     "uvicorn[standard]>=0.35.0,<1.0.0" \
     "python-docx>=1.1.2,<2.0.0" \
-    "openpyxl>=3.1.0,<4.0.0" \
     "pydantic-settings>=2.5.0,<3.0.0" \
     "sqlalchemy[asyncio]>=2.0.30,<3.0.0" \
     "asyncpg>=0.29.0,<1.0.0" \
