@@ -556,6 +556,11 @@ button:disabled {
   padding: 11px 13px;
   border-radius: 14px;
   line-height: 1.45;
+  display: grid;
+  gap: 8px;
+}
+
+.message-text {
   white-space: pre-wrap;
 }
 
@@ -570,6 +575,105 @@ button:disabled {
   justify-self: end;
   color: #fff;
   background: var(--accent);
+}
+
+/* Извлечённые из диалога правки полей ТЗ */
+.chat-updates {
+  display: grid;
+  gap: 6px;
+}
+
+.chat-update {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel, #fff);
+}
+
+.chat-update.applied {
+  opacity: .7;
+  border-color: #b6d8b8;
+  background: #f1f8f1;
+}
+
+.chat-update-main {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.chat-update-label {
+  font-size: 11px;
+  color: var(--muted, #6b7785);
+}
+
+.chat-update-value {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-update-apply {
+  flex: none;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+.chat-apply-all {
+  justify-self: start;
+  background: none;
+  border: none;
+  padding: 2px 0;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-apply-all:disabled {
+  color: var(--muted, #9aa5b1);
+  cursor: default;
+}
+
+/* Подсказки-действия */
+.chat-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel, #fff);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chip:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chip:disabled {
+  opacity: .55;
+  cursor: default;
+}
+
+/* Предупреждения ассистента */
+.chat-warnings {
+  margin: 0;
+  padding-left: 16px;
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+  color: #9a6a00;
 }
 
 .assistant-input {
@@ -1186,6 +1290,7 @@ select:focus { border-color: #1579c6; box-shadow: 0 0 0 3px rgba(21,121,198,.10)
 .result-card.selected .score { color: var(--accent); background: #fff; }
 .result-copy em { color: #176eb4; }
 .compact-card { border-radius: 11px; background: #f8fafc; }
+.template-recommendation-copy { margin: 8px 0 18px; color: var(--muted); line-height: 1.6; }
 
 .template-field-group { background: #f8fafc; }
 .template-field-group[open] { border-color: #bdd6eb; background: #fbfdff; }
@@ -1201,6 +1306,11 @@ select:focus { border-color: #1579c6; box-shadow: 0 0 0 3px rgba(21,121,198,.10)
 .additional-service-grid input { accent-color: var(--accent); }
 .contractor-est strong,
 .roadmap-stages .rs-days { color: var(--accent); }
+.roadmap-explanation { max-width: 720px; margin: 6px 0 0; font-size: .78rem; }
+.roadmap-methodology {
+  margin: 10px 0 14px; padding: 10px 12px; color: #536b83; background: #f3f8fd;
+  border-left: 3px solid #7db5df; border-radius: 6px; font-size: .76rem; line-height: 1.45;
+}
 .roadmap-seg.c0 { background: #075aa8; }
 .roadmap-seg.c1 { background: #1686ce; }
 .roadmap-seg.c2 { background: #5975b8; }

@@ -35,8 +35,11 @@ def product_estimate(
 
 
 @router.post("/for-tz/{tz_id}", response_model=TZEstimateResponse)
-async def estimate_for_tz(tz_id: str) -> TZEstimateResponse:
+async def estimate_for_tz(
+    tz_id: str,
+    additional_product_ids: list[str] = Query(default=[]),
+) -> TZEstimateResponse:
     document = await tz_repository.get(tz_id)
     if document is None:
         raise HTTPException(status_code=404, detail="ТЗ не найдено")
-    return procurement_service.estimate_for_tz(document)
+    return procurement_service.estimate_for_tz(document, additional_product_ids)

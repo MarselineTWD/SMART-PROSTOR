@@ -14,7 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.core.db import SessionLocal
 from backend.app.models.db import TZDocumentORM
-from backend.app.models.domain import TZDocument, TZDocumentSection
+from backend.app.models.domain import TZChatMessage, TZDocument, TZDocumentSection
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ def _to_columns(doc: TZDocument) -> dict:
         "input_data": doc.input_data.model_dump(),
         "sections": [s.model_dump() for s in doc.sections],
         "notes": doc.notes,
+        "chat": [m.model_dump(mode="json") for m in doc.chat],
         "created_at": doc.created_at,
         "updated_at": doc.updated_at,
     }
@@ -63,6 +64,7 @@ def _from_orm(row: TZDocumentORM) -> TZDocument:
         input_data=row.input_data or {},
         sections=[TZDocumentSection(**s) for s in (row.sections or [])],
         notes=row.notes or [],
+        chat=[TZChatMessage(**m) for m in (getattr(row, "chat", None) or [])],
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

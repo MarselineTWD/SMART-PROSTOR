@@ -220,6 +220,34 @@ class ProcurementEstimateTest(unittest.TestCase):
                 company["base_cost_without_vat"] + company["additional_cost_without_vat"],
             )
 
+    def test_tz_roadmap_uses_only_stages_written_in_document(self):
+        template = tz_template_service.get_template("tz-geology-concept")
+        document = tz_generator.new_document(
+            template,
+            title="ТЗ: Концепт геологии Северного участка",
+            object_name="Северный участок",
+            customer_name="Блок геологии",
+            input_data=DraftInputData(goal="Подготовить геологическую концепцию", deadline="2026-12-20"),
+        )
+        expected_stages = ["Проверка исходных данных", "Интерпретация", "Выпуск отчёта"]
+        document.requisites["stages"] = expected_stages
+
+        response = procurement_service.estimate_for_tz(document)
+        estimate = response["estimate"]
+
+        self.assertIsNotNone(estimate)
+        self.assertEqual(estimate["roadmap_source"], "tz")
+        self.assertEqual(estimate["tz_id"], document.id)
+        for company in estimate["companies"]:
+            self.assertEqual([stage["name"] for stage in company["stages"]], expected_stages)
+            self.assertEqual(sum(stage["days"] for stage in company["stages"]), company["estimated_days"])
+
+    def test_tz_without_stages_has_no_roadmap(self):
+        template = tz_template_service.get_template("tz-geology-concept")
+        document = tz_generator.new_document(template, title="ТЗ: Концепт геологии")
+        document.requisites["stages"] = []
+        self.assertIsNone(procurement_service.estimate_for_tz(document)["estimate"])
+
 
 class TZValidationTest(unittest.TestCase):
     def test_validation_returns_actionable_3d_and_required_field_issues(self):

@@ -126,6 +126,62 @@ class ProcurementService:
             offset += days
         return total, out
 
+    def _build_tz_roadmap(
+        self,
+        calc: dict,
+        stage_names: list[str],
+        plan_start: str | None = None,
+    ) -> tuple[int, list[dict]]:
+        """Распределяет срок подрядчика только по этапам пользовательского ТЗ.
+
+        XLSX используется для оценки общей длительности подрядчика. Названия и
+        количество этапов берутся из сохранённого ТЗ, а не из исторического РС.
+        Если число исторических и пользовательских этапов совпадает, сохраняем
+        исторические пропорции; иначе делим срок поровну и явно не выдумываем
+        отсутствующую в исходных данных детализацию.
+        """
+        names = [str(name).strip() for name in stage_names if str(name).strip()]
+        if not names:
+            return self._span_days(calc), []
+
+        total = max(self._span_days(calc), len(names))
+        historical = sorted(
+            self.stages_by_calc.get(calc["calc_id"], []),
+            key=lambda item: (item.get("order_num") or 0, item.get("start_date") or ""),
+        )
+        weights: list[int] = []
+        if len(historical) == len(names):
+            for item in historical:
+                start, end = _pdate(item.get("start_date")), _pdate(item.get("end_date"))
+                weights.append(max((end - start).days, 1) if start and end else 1)
+        else:
+            weights = [1] * len(names)
+
+        weight_sum = sum(weights)
+        start = _pdate(plan_start) or date.today()
+        out: list[dict] = []
+        offset = 0
+        remaining = total
+        for index, (name, weight) in enumerate(zip(names, weights)):
+            stages_left = len(names) - index - 1
+            days = remaining if stages_left == 0 else max(1, round(total * weight / weight_sum))
+            days = min(days, remaining - stages_left)
+            historical_item = historical[index] if len(historical) == len(names) else {}
+            out.append({
+                "order": index + 1,
+                "name": name,
+                "days": days,
+                "weeks": round(days / 7, 1),
+                "offset_days": offset,
+                "percent": round(days * 100 / total, 1),
+                "documentation": historical_item.get("documentation") or "",
+                "start_date": (start + timedelta(days=offset)).isoformat(),
+                "end_date": (start + timedelta(days=offset + days)).isoformat(),
+            })
+            offset += days
+            remaining -= days
+        return total, out
+
     def _cost_for_calc(self, product_id: str, calc: dict) -> dict:
         total = self._span_days(calc)
         workdays = max(round(total * 5 / 7), 1)
@@ -187,7 +243,14 @@ class ProcurementService:
         out.sort(key=lambda r: (-r["company_count"], r["name"]))
         return out
 
-    def estimate_product(self, product_id: str, additional_product_ids: list[str] | None = None) -> dict | None:
+    def estimate_product(
+        self,
+        product_id: str,
+        additional_product_ids: list[str] | None = None,
+        *,
+        roadmap_stages: list[str] | None = None,
+        plan_start: str | None = None,
+    ) -> dict | None:
         """Для продукта — срок, роадмап и индикативная стоимость подрядчиков."""
         self._load()
         calcs = self.calcs_by_product.get(product_id)
@@ -210,7 +273,11 @@ class ProcurementService:
         for cid, comp_calcs in by_company.items():
             rep = max(comp_calcs, key=lambda c: (len(self.stages_by_calc.get(c["calc_id"], [])), self._span_days(c)))
             spans = [self._span_days(c) for c in comp_calcs]
-            total, roadmap = self._build_roadmap(rep)
+            total, roadmap = (
+                self._build_tz_roadmap(rep, roadmap_stages, plan_start)
+                if roadmap_stages
+                else self._build_roadmap(rep)
+            )
             info = self.companies.get(cid, {})
             contract = self.contracts.get(rep.get("contract_id") or "", {})
             workdays = max(round(total * 5 / 7), 1)
@@ -320,15 +387,32 @@ class ProcurementService:
         scored.sort(key=lambda r: (-r["overlap"], -r["score"]))
         return scored[:limit]
 
-    def estimate_for_tz(self, tz) -> dict:
-        """По ТЗ подобрать продукт и вернуть оценку + альтернативы."""
+    def estimate_for_tz(self, tz, additional_product_ids: list[str] | None = None) -> dict:
+        """Строит оценку по этапам ТЗ; каталог нужен только для подбора подрядчиков."""
+        user_stages = [
+            str(stage).strip()
+            for stage in (getattr(tz, "requisites", {}) or {}).get("stages", [])
+            if str(stage).strip()
+        ]
         query = " ".join(filter(None, [
             getattr(tz, "template_name", "") or "",
             getattr(tz, "title", "") or "",
             (getattr(tz, "object_name", "") or ""),
+            (getattr(getattr(tz, "input_data", None), "goal", "") or ""),
         ]))
         matches = self.match_products(query, limit=5)
-        estimate = self.estimate_product(matches[0]["product_id"]) if matches else None
+        estimate = None
+        if matches and user_stages:
+            estimate = self.estimate_product(
+                matches[0]["product_id"],
+                additional_product_ids,
+                roadmap_stages=user_stages,
+                plan_start=(getattr(tz, "requisites", {}) or {}).get("start_date"),
+            )
+            if estimate:
+                estimate["roadmap_source"] = "tz"
+                estimate["tz_id"] = getattr(tz, "id", None)
+                estimate["tz_title"] = getattr(tz, "title", "") or getattr(tz, "template_name", "")
         return {"query": query, "matched": matches[0] if matches else None,
                 "alternatives": matches[1:], "estimate": estimate}
 

@@ -171,6 +171,37 @@ class TZDocumentSection(BaseModel):
     source: SectionSource = "template"
 
 
+# --- Чат-ассистент по ТЗ ------------------------------------------------------
+
+FieldTarget = Literal["document", "input_data", "requisites", "section"]
+
+
+class TZFieldUpdate(BaseModel):
+    """Структурированная правка, извлечённая ИИ из диалога и применяемая в ТЗ.
+
+    ``target`` определяет, куда пишется значение: реквизиты документа,
+    исходные данные, доп. реквизиты шаблона или содержимое раздела.
+    """
+
+    target: FieldTarget
+    key: str
+    label: str = ""
+    value: Any = None
+    confidence: float = 0.0
+    evidence: str = ""
+    applied: bool = False
+
+
+class TZChatMessage(BaseModel):
+    id: str
+    role: Literal["user", "assistant"]
+    text: str
+    created_at: datetime | None = None
+    suggestions: list[str] = Field(default_factory=list)
+    field_updates: list[TZFieldUpdate] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class TZDocument(BaseModel):
     id: str
     template_key: str
@@ -187,6 +218,7 @@ class TZDocument(BaseModel):
     input_data: DraftInputData = Field(default_factory=DraftInputData)
     sections: list[TZDocumentSection] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    chat: list[TZChatMessage] = Field(default_factory=list)
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

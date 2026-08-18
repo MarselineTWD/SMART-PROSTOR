@@ -85,6 +85,9 @@ class ProductEstimateResponse(BaseModel):
     summary: EstimateSummary
     available_additional_services: list[AdditionalServiceOption] = []
     selected_additional_product_ids: list[str] = []
+    roadmap_source: str = "catalog"
+    tz_id: str | None = None
+    tz_title: str | None = None
 
 
 class ProductSummary(BaseModel):

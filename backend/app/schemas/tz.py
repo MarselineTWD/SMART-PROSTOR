@@ -4,10 +4,13 @@ from pydantic import BaseModel, Field
 
 from backend.app.models.domain import (
     DraftInputData,
+    TZChatMessage,
     TZDocument,
     TZDocumentSection,
+    TZFieldUpdate,
     TZTemplate,
 )
+from backend.app.schemas.assistant import AllowedField
 
 
 # --- Шаблоны ------------------------------------------------------------------
@@ -104,3 +107,34 @@ class TZDocumentSummary(BaseModel):
 
 class TZListResponse(BaseModel):
     documents: list[TZDocumentSummary]
+
+
+# --- Чат по документу ТЗ ------------------------------------------------------
+
+class TZChatSendRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class TZChatSendResponse(BaseModel):
+    message: TZChatMessage
+    provider: str = "rules"
+    model: str | None = None
+    fallback: bool = False
+    validation: TZValidationResult
+
+
+class TZChatHistoryResponse(BaseModel):
+    messages: list[TZChatMessage] = Field(default_factory=list)
+    allowed_fields: list[AllowedField] = Field(default_factory=list)
+
+
+class TZChatApplyRequest(BaseModel):
+    updates: list[TZFieldUpdate] = Field(default_factory=list)
+
+
+class TZChatApplyResponse(BaseModel):
+    document: TZDocument
+    validation: TZValidationResult
+    applied: list[TZFieldUpdate] = Field(default_factory=list)
+    skipped: list[TZFieldUpdate] = Field(default_factory=list)

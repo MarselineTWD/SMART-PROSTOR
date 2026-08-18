@@ -8,6 +8,11 @@ from backend.app.models.domain import TZDocumentSection
 from backend.app.schemas.tz import (
     TemplateDetailResponse,
     TemplatesResponse,
+    TZChatApplyRequest,
+    TZChatApplyResponse,
+    TZChatHistoryResponse,
+    TZChatSendRequest,
+    TZChatSendResponse,
     TZCreateRequest,
     TZDocumentResponse,
     TZDocumentSummary,
@@ -18,7 +23,10 @@ from backend.app.schemas.tz import (
     TZValidationResult,
     TZUpdateRequest,
 )
+from backend.app.core.config import settings
+from backend.app.services.assistant import assistant_service
 from backend.app.services.documents import document_export_service
+from backend.app.services.tz_chat import tz_chat_service
 from backend.app.services.tz_generator import tz_generator
 from backend.app.services.tz_repository import tz_repository
 from backend.app.services.tz_templates import tz_template_service
@@ -224,3 +232,106 @@ async def export_document(doc_id: str) -> FileResponse:
         filename=path.name,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+
+# --- Чат по документу ТЗ ------------------------------------------------------
+
+def _chat_context(document, validation, extra: dict | None) -> dict:
+    context = {
+        "tz": {
+            "id": document.id,
+            "template_name": document.template_name,
+            "ready_score": document.ready_score,
+            "object_name": document.object_name,
+            "customer_name": document.customer_name,
+            "executor_name": document.executor_name,
+            "goal": document.input_data.goal,
+            "deadline": document.input_data.deadline,
+        },
+        "validation_issues": [i.model_dump() for i in validation.issues],
+        "empty_sections": [s.title for s in document.sections if not s.content.strip()],
+    }
+    if extra:
+        context.update(extra)
+    return context
+
+
+@router.get("/{doc_id}/chat", response_model=TZChatHistoryResponse)
+async def get_chat(doc_id: str) -> TZChatHistoryResponse:
+    document = await tz_repository.get(doc_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="ТЗ не найдено")
+    template = tz_template_service.get_or_default(document.template_key)
+    return TZChatHistoryResponse(
+        messages=document.chat,
+        allowed_fields=tz_chat_service.allowed_fields(document, template),
+    )
+
+
+@router.post("/{doc_id}/chat", response_model=TZChatSendResponse)
+async def post_chat(doc_id: str, payload: TZChatSendRequest) -> TZChatSendResponse:
+    document = await tz_repository.get(doc_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="ТЗ не найдено")
+    template = tz_template_service.get_or_default(document.template_key)
+    validation = tz_validation_service.validate(document)
+    allowed = tz_chat_service.allowed_fields(document, template)
+    history = [(m.role, m.text) for m in document.chat]
+
+    document.chat.append(tz_chat_service.make_message("user", payload.message))
+    reply, provider, fallback = assistant_service.generate(
+        message=payload.message,
+        context=_chat_context(document, validation, payload.context),
+        history=history,
+        allowed_fields=allowed,
+    )
+    assistant_message = tz_chat_service.make_message(
+        "assistant",
+        reply.reply,
+        suggestions=reply.suggestions,
+        field_updates=reply.field_updates,
+        warnings=reply.warnings,
+    )
+    document.chat.append(assistant_message)
+
+    validation = tz_validation_service.validate(document)
+    document.ready_score = validation.ready_score
+    document.updated_at = datetime.now(timezone.utc)
+    await tz_repository.update(document)
+    return TZChatSendResponse(
+        message=assistant_message,
+        provider=provider,
+        model=settings.llm_model if provider == "deepseek" else None,
+        fallback=fallback,
+        validation=validation,
+    )
+
+
+@router.post("/{doc_id}/chat/apply", response_model=TZChatApplyResponse)
+async def apply_chat(doc_id: str, payload: TZChatApplyRequest) -> TZChatApplyResponse:
+    document = await tz_repository.get(doc_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="ТЗ не найдено")
+    template = tz_template_service.get_or_default(document.template_key)
+
+    applied, skipped = tz_chat_service.apply(document, template, payload.updates)
+    if applied:
+        _mark_applied(document, applied)
+        note = f"ИИ перенёс в ТЗ значений: {len(applied)}."
+        document.notes = [*[n for n in document.notes if not n.startswith("ИИ перенёс")], note]
+
+    validation = tz_validation_service.validate(document)
+    document.ready_score = validation.ready_score
+    await tz_repository.update(document)
+    return TZChatApplyResponse(
+        document=document, validation=validation, applied=applied, skipped=skipped
+    )
+
+
+def _mark_applied(document, applied) -> None:
+    """Помечает применённые правки в истории чата (для стабильного состояния UI)."""
+    keys = {(u.target, u.key) for u in applied}
+    for message in document.chat:
+        for update in message.field_updates:
+            if (update.target, update.key) in keys:
+                update.applied = True
