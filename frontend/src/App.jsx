@@ -222,6 +222,7 @@ export default function App() {
 
   // Аналитика и ассистент
   const [analytics, setAnalytics] = useState(null);
+  const [contractorAnalytics, setContractorAnalytics] = useState(null);
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [assistantStatus, setAssistantStatus] = useState(null);
   const [chatInput, setChatInput] = useState("");
@@ -233,6 +234,7 @@ export default function App() {
   useEffect(() => {
     runSearch(demoQuery);
     loadAnalytics();
+    loadContractorAnalytics();
     loadTemplates();
     loadTzList();
     loadEstProducts();
@@ -289,6 +291,14 @@ export default function App() {
       setAnalytics(await request("/analytics/overview"));
     } catch {
       setAnalytics(null);
+    }
+  }
+
+  async function loadContractorAnalytics() {
+    try {
+      setContractorAnalytics(await request("/analytics/contractors"));
+    } catch {
+      setContractorAnalytics(null);
     }
   }
 
@@ -780,7 +790,7 @@ export default function App() {
             selectedAdditionalServices={selectedAdditionalServices} onToggleAdditional={toggleAdditionalService} />
         )}
 
-        {activeTab === "analytics" && <AnalyticsView analytics={analytics} />}
+        {activeTab === "analytics" && <AnalyticsView analytics={analytics} contractorAnalytics={contractorAnalytics} />}
       </section>
 
       <AssistantSidebar
@@ -1400,7 +1410,7 @@ function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend,
   );
 }
 
-function AnalyticsView({ analytics }) {
+function AnalyticsView({ analytics, contractorAnalytics }) {
   if (!analytics) {
     return <section className="panel"><EmptyState text="Аналитика будет доступна после запуска backend." /></section>;
   }
@@ -1412,6 +1422,7 @@ function AnalyticsView({ analytics }) {
     ["Операции", coverage.operations || 0, 318],
   ];
   const productBars = (analytics.popular_work_types || []).map((label, index) => ({ label, value: [92, 78, 64, 51][index] || 42 }));
+  const contractorRanking = contractorAnalytics?.top_by_rating || [];
   return (
     <div className="analytics-dashboard">
       <section className="analytics-hero">
@@ -1432,6 +1443,14 @@ function AnalyticsView({ analytics }) {
         <section className="panel process-card"><div className="analytics-title"><div><span className="eyebrow">ПРОЦЕСС</span><h4>Воронка подготовки ТЗ</h4></div></div><div className="process-funnel"><div><strong>462</strong><span>запроса</span></div><i>→</i><div><strong>318</strong><span>распознано</span></div><i>→</i><div><strong>48</strong><span>продуктов</span></div><i>→</i><div className="accent"><strong>20</strong><span>договоров</span></div></div><p>AI помогает сократить путь от запроса до готового ТЗ и подходящего договора.</p></section>
         <section className="panel analytics-risks"><div className="analytics-title"><div><span className="eyebrow">КАЧЕСТВО</span><h4>Что чаще всего нужно уточнить</h4></div></div><ol>{(analytics.typical_request_errors || analytics.common_risk_patterns || []).slice(0,4).map((item,index)=><li key={item}><span>{index+1}</span><b>{item}</b></li>)}</ol></section>
       </div>
+
+      <section className="panel contractor-leaderboard">
+        <div className="analytics-title"><div><span className="eyebrow">ПОДРЯДЧИКИ</span><h4>Рейтинг подрядчиков</h4></div><small>{contractorAnalytics?.summary?.total_contractors ? `${contractorAnalytics.summary.total_contractors} компаний в базе` : "По данным ПРОСТОР"}</small></div>
+        {contractorRanking.length ? <div className="contractor-ranking-list">{contractorRanking.map((company,index)=>{
+          const rating=Number(company.rating ?? company.value ?? 0);
+          return <article className={index<3?'top-contractor':''} key={company.company_id}><span className={'rank-place place-'+(index+1)}>{index+1}</span><div><b>{company.company_name}</b><small>{index===0?'Лидер рейтинга':index<3?'Входит в топ-3':'Проверенный подрядчик'}</small></div><span className="rating-stars" aria-label={`Рейтинг ${rating.toFixed(1)} из 5`}><i style={{width:`${Math.min(100,rating/5*100)}%`}}>★★★★★</i><em>★★★★★</em></span><strong>{rating.toFixed(1)}</strong></article>;
+        })}</div> : <div className="contractor-ranking-empty">Рейтинг появится после загрузки данных подрядчиков</div>}
+      </section>
 
       <section className="panel analytics-insight"><span className="insight-icon"><Sparkles size={22}/></span><div><span className="eyebrow">AI-ИНСАЙТ</span><h4>Точка роста продуктового каталога</h4><p>{analytics.product_packaging_candidates?.[0] || 'Объедините наиболее востребованные услуги в готовый пакет.'}</p></div><div className="insight-tags">{(analytics.most_requested_products || []).slice(0,3).map(item=><span key={item}>{item}</span>)}</div></section>
     </div>
