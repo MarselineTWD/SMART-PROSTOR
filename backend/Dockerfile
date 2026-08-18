@@ -30,7 +30,8 @@ RUN pip install \
     "pgvector>=0.3.0,<1.0.0" \
     "alembic>=1.13.0,<2.0.0" \
     "sentence-transformers>=3.0.0,<4.0.0" \
-    "numpy>=1.26.0,<3.0.0"
+    "numpy>=1.26.0,<3.0.0" \
+    "boto3>=1.34.0,<2.0.0"
 
 # Pre-cache the embedding model so container start doesn't need network.
 ARG EMBEDDING_MODEL_NAME=intfloat/multilingual-e5-small

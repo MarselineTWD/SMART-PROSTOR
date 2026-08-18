@@ -18,6 +18,7 @@ from backend.app.models.domain import (
     TZDocumentSection,
     TZTemplate,
 )
+from backend.app.services.normative_acts import normative_act_service
 from backend.app.services.tz_templates import tz_template_service
 from backend.app.services.llm import llm_complete
 
@@ -162,6 +163,7 @@ class TZGenerator:
             and document.requisites[field.key] not in (None, "", False)
         ]
         return {
+            "template_key": template.key,
             "object": document.object_name or "объект работ",
             "customer": document.customer_name or "Заказчик",
             "executor": document.executor_name or "Исполнитель",
@@ -261,11 +263,23 @@ class TZGenerator:
         )
 
     def _sec_work_requirements(self, ctx: dict) -> str:
-        return (
+        preamble = (
             "Работы выполняются в соответствии с действующими нормативными документами и "
             "методиками Заказчика с использованием лицензионного программного обеспечения. "
             "Исполнитель обеспечивает квалифицированный персонал и соблюдение требований "
             "промышленной безопасности, охраны труда и окружающей среды."
+        )
+        # Список НПА подгружается из БД для конкретного шаблона (справочник
+        # наполнен из docx-шаблонов ТЗ; embedding позволяет в будущем
+        # рекомендовать дополнительные акты по описанию работ).
+        acts = normative_act_service.acts_for_template(ctx.get("template_key", ""))
+        if not acts:
+            return preamble
+        listed = "\n".join(f"{i}. {a.title}." for i, a in enumerate(acts, start=1))
+        return (
+            f"{preamble}\n\n"
+            "Материалы должны соответствовать требованиям следующих нормативных документов:\n"
+            f"{listed}"
         )
 
     def _sec_quality(self, ctx: dict) -> str:

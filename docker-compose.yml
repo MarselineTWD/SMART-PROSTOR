@@ -1,6 +1,47 @@
 name: prostor
 
 services:
+  minio:
+    # Пиним до майского релиза 2025 — последний с открытой встроенной Web Console.
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: prostor-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-prostor}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-prostor12345}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"       # S3 API
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"   # Web Console (логин из env)
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    # Одноразовый контейнер: создаёт бакеты, чтобы бэку не приходилось делать
+    # это на каждом старте. Запустился → отдал exit 0.
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: prostor-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-prostor}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-prostor12345}
+      TEMPLATES_BUCKET: ${S3_BUCKET_TEMPLATES:-prostor-templates}
+      TZ_BUCKET: ${S3_BUCKET_TZ:-prostor-tz}
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD;
+        mc mb --ignore-existing local/$$TEMPLATES_BUCKET;
+        mc mb --ignore-existing local/$$TZ_BUCKET;
+        echo 'buckets ready';
+      "
+    restart: "no"
+
   postgres:
     image: pgvector/pgvector:pg16
     container_name: prostor-postgres
@@ -30,6 +71,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       # Полностью настраиваемая строка подключения — можно указать любой хост/порт
       # (внешний PostgreSQL, изменить пароль и т.д.) без пересборки образа.
@@ -41,11 +84,23 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-45}
+      # MinIO / S3
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+      S3_PUBLIC_ENDPOINT_URL: ${S3_PUBLIC_ENDPOINT_URL:-http://localhost:9000}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-prostor}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-prostor12345}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET_TEMPLATES: ${S3_BUCKET_TEMPLATES:-prostor-templates}
+      S3_BUCKET_TZ: ${S3_BUCKET_TZ:-prostor-tz}
       CORS_ORIGINS: '["http://localhost:8080","http://127.0.0.1:8080","http://localhost:5173"]'
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:
       - hf_cache:/opt/hf-cache
+      # Read-only монтирование docx-шаблонов: backend при первом старте
+      # заливает их в MinIO-бакет prostor-templates. Если каталога нет —
+      # шаг молча пропускается (см. backend/app/scripts/upload_templates.py).
+      - ./Файлы/Выгрузка из системы/Шаблоны ТЗ:/app/templates:ro
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8000/api/health"]
       interval: 5s
@@ -72,3 +127,4 @@ services:
 volumes:
   postgres_data:
   hf_cache:
+  minio_data:

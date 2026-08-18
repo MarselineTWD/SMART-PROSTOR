@@ -41,6 +41,7 @@ def _to_columns(doc: TZDocument) -> dict:
         "input_data": doc.input_data.model_dump(),
         "sections": [s.model_dump() for s in doc.sections],
         "notes": doc.notes,
+        "storage_key": doc.storage_key,
         "created_at": doc.created_at,
         "updated_at": doc.updated_at,
     }
@@ -63,6 +64,7 @@ def _from_orm(row: TZDocumentORM) -> TZDocument:
         input_data=row.input_data or {},
         sections=[TZDocumentSection(**s) for s in (row.sections or [])],
         notes=row.notes or [],
+        storage_key=row.storage_key,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

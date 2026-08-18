@@ -187,6 +187,7 @@ class TZDocument(BaseModel):
     input_data: DraftInputData = Field(default_factory=DraftInputData)
     sections: list[TZDocumentSection] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    storage_key: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
