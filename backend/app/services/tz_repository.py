@@ -42,6 +42,7 @@ def _to_columns(doc: TZDocument) -> dict:
         "sections": [s.model_dump() for s in doc.sections],
         "notes": doc.notes,
         "chat": [m.model_dump(mode="json") for m in doc.chat],
+        "storage_key": doc.storage_key,
         "created_at": doc.created_at,
         "updated_at": doc.updated_at,
     }
@@ -65,6 +66,7 @@ def _from_orm(row: TZDocumentORM) -> TZDocument:
         sections=[TZDocumentSection(**s) for s in (row.sections or [])],
         notes=row.notes or [],
         chat=[TZChatMessage(**m) for m in (getattr(row, "chat", None) or [])],
+        storage_key=row.storage_key,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

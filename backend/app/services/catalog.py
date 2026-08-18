@@ -1,14 +1,71 @@
-from backend.app.data.catalog import COMPANIES, CONTRACTS, HISTORICAL_CASES, PRODUCTS, TEMPLATES
-from backend.app.models.domain import Company, Contract, HistoricalCase, Product, Template
+"""In-memory catalog with a Postgres snapshot as source of truth.
+
+Public API is intentionally unchanged from the previous mocks-backed
+version: sync methods returning Pydantic domain models. The only
+difference is that the data now comes from Postgres — refreshed once
+on app startup via `refresh(session)` and served from an in-memory
+dict thereafter.
+
+Templates remain hardcoded in `backend.app.data.catalog.TEMPLATES`:
+the domain templates power the legacy drafts/rules pipeline and their
+schema is not (yet) modelled in Postgres.
+"""
+from __future__ import annotations
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.app.data.catalog import (
+    COMPANIES,
+    CONTRACTS,
+    HISTORICAL_CASES,
+    PRODUCTS,
+    TEMPLATES,
+)
+from backend.app.models.domain import (
+    Company,
+    Contract,
+    HistoricalCase,
+    Product,
+    Template,
+)
+from backend.app.services.db_catalog import CatalogSnapshot, load_snapshot
 
 
 class CatalogService:
     def __init__(self) -> None:
-        self._companies = {item.id: item for item in COMPANIES}
-        self._contracts = {item.id: item for item in CONTRACTS}
-        self._products = {item.id: item for item in PRODUCTS}
-        self._templates = {item.id: item for item in TEMPLATES}
-        self._historical_cases = HISTORICAL_CASES
+        # Keep the legacy catalog as a cold-start fallback. A successful app
+        # startup immediately replaces it with the Postgres snapshot in
+        # ``refresh``; the fallback preserves CLI/tests and degraded operation
+        # while the database is temporarily unavailable.
+        self._companies: dict[str, Company] = {item.id: item for item in COMPANIES}
+        self._contracts: dict[str, Contract] = {item.id: item for item in CONTRACTS}
+        self._products: dict[str, Product] = {item.id: item for item in PRODUCTS}
+        self._templates: dict[str, Template] = {tpl.id: tpl for tpl in TEMPLATES}
+        self._historical_cases: list[HistoricalCase] = list(HISTORICAL_CASES)
+        self._loaded: bool = False
+
+    # -- lifecycle -----------------------------------------------------------
+
+    async def refresh(self, session: AsyncSession) -> None:
+        """Replace the in-memory snapshot with a fresh Postgres dump."""
+        snapshot = await load_snapshot(session, seed_templates=TEMPLATES)
+        self._replace(snapshot)
+
+    def _replace(self, snapshot: CatalogSnapshot) -> None:
+        self._companies = {c.id: c for c in snapshot.companies}
+        self._contracts = {c.id: c for c in snapshot.contracts}
+        self._products = {p.id: p for p in snapshot.products}
+        # Templates from snapshot may include DB-backed ones later;
+        # for now `seed_templates=TEMPLATES` keeps behavior identical.
+        self._templates = {t.id: t for t in snapshot.templates}
+        self._historical_cases = list(snapshot.historical_cases)
+        self._loaded = True
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    # -- reads ---------------------------------------------------------------
 
     def list_products(self) -> list[Product]:
         return list(self._products.values())
@@ -40,10 +97,16 @@ class CatalogService:
         ]
         return sorted(companies, key=lambda item: item.rating, reverse=True)
 
-    def list_product_contracts(self, product_id: str, company_id: str | None = None) -> list[Contract]:
-        contracts = [contract for contract in self._contracts.values() if product_id in contract.product_ids]
+    def list_product_contracts(
+        self, product_id: str, company_id: str | None = None
+    ) -> list[Contract]:
+        contracts = [
+            contract
+            for contract in self._contracts.values()
+            if product_id in contract.product_ids
+        ]
         if company_id:
-            contracts = [contract for contract in contracts if contract.company_id == company_id]
+            contracts = [c for c in contracts if c.company_id == company_id]
         return contracts
 
     def list_historical_cases(self, product_id: str) -> list[HistoricalCase]:
@@ -51,4 +114,3 @@ class CatalogService:
 
 
 catalog_service = CatalogService()
-

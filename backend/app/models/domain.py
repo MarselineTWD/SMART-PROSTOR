@@ -219,6 +219,7 @@ class TZDocument(BaseModel):
     sections: list[TZDocumentSection] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     chat: list[TZChatMessage] = Field(default_factory=list)
+    storage_key: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

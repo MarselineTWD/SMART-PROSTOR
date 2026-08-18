@@ -47,6 +47,20 @@ class Settings(BaseSettings):
     def llm_enabled(self) -> bool:
         return bool(self.llm_api_key.strip())
 
+    # --- S3 / MinIO ----------------------------------------------------------
+    # Endpoint для серверных вызовов (backend → minio по внутренней сети).
+    s3_endpoint_url: str = Field(default="http://minio:9000", alias="S3_ENDPOINT_URL")
+    # Endpoint, который отдаётся браузеру в presigned URL. Обычно наружу.
+    s3_public_endpoint_url: str = Field(
+        default="http://localhost:9000", alias="S3_PUBLIC_ENDPOINT_URL"
+    )
+    s3_access_key: str = Field(default="prostor", alias="S3_ACCESS_KEY")
+    s3_secret_key: str = Field(default="prostor12345", alias="S3_SECRET_KEY")
+    s3_region: str = Field(default="us-east-1", alias="S3_REGION")
+    s3_bucket_templates: str = Field(default="prostor-templates", alias="S3_BUCKET_TEMPLATES")
+    s3_bucket_tz: str = Field(default="prostor-tz", alias="S3_BUCKET_TZ")
+    s3_presign_ttl: int = Field(default=3600, alias="S3_PRESIGN_TTL")
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

@@ -11,7 +11,13 @@ import logging
 from sqlalchemy import select
 
 from backend.app.core.db import SessionLocal
-from backend.app.models.db import Company, HistoricalCase, IntentPrompt, Product
+from backend.app.models.db import (
+    Company,
+    HistoricalCase,
+    IntentPrompt,
+    NormativeAct,
+    Product,
+)
 from backend.app.services.embeddings import get_embeddings_service
 
 
@@ -20,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 async def _has_missing_embeddings(session) -> bool:
     """Avoid loading the ML model when the database is already backfilled."""
-    for entity_cls in (Product, Company, HistoricalCase, IntentPrompt):
+    for entity_cls in (Product, Company, HistoricalCase, IntentPrompt, NormativeAct):
         result = await session.execute(
             select(entity_cls.id).where(entity_cls.embedding.is_(None)).limit(1)
         )
@@ -46,6 +52,15 @@ def _company_text(c: Company) -> str:
 
 def _case_text(h: HistoricalCase) -> str:
     return f"{h.title}. Объект: {h.object_name}. {h.summary}"
+
+
+def _act_text(a: NormativeAct) -> str:
+    parts = [a.title]
+    if a.document_type:
+        parts.append(f"Тип документа: {a.document_type}")
+    if a.authority:
+        parts.append(f"Издатель: {a.authority}")
+    return ". ".join(parts)
 
 
 async def _embed_missing(session, model, entity_cls, text_fn) -> int:
@@ -78,6 +93,7 @@ async def main() -> None:
         n_products = await _embed_missing(session, model, Product, _product_text)
         n_companies = await _embed_missing(session, model, Company, _company_text)
         n_cases = await _embed_missing(session, model, HistoricalCase, _case_text)
+        n_acts = await _embed_missing(session, model, NormativeAct, _act_text)
 
         # Intent prompts are stored as-is (already look like `query:` style).
         result = await session.execute(
@@ -91,10 +107,11 @@ async def main() -> None:
             await session.commit()
 
         logger.info(
-            "Embedded: products=%s companies=%s cases=%s intents=%s",
+            "Embedded: products=%s companies=%s cases=%s acts=%s intents=%s",
             n_products,
             n_companies,
             n_cases,
+            n_acts,
             len(intents),
         )
 

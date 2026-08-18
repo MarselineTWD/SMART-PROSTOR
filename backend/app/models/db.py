@@ -102,6 +102,46 @@ class IntentPrompt(Base):
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMB_DIM), nullable=True)
 
 
+class NormativeAct(Base):
+    """Каталог нормативных актов, регламентирующих порядок выполнения работ.
+
+    Наполняется из ``normative_acts_seed.json`` (генерируется скриптом
+    ``backend.app.scripts.extract_normative_acts`` из docx-шаблонов ТЗ).
+    Поле ``embedding`` строится по ``title`` — для семантической выдачи
+    «какие ещё акты релевантны данной работе».
+    """
+
+    __tablename__ = "normative_acts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    document_type: Mapped[str] = mapped_column(String, nullable=False, default="Прочее")
+    authority: Mapped[str | None] = mapped_column(String, nullable=True)
+    number: Mapped[str | None] = mapped_column(String, nullable=True)
+    date_issued: Mapped[date | None] = mapped_column(Date, nullable=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    short_title: Mapped[str] = mapped_column(String, nullable=False, default="")
+    url: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMB_DIM), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TemplateNormativeAct(Base):
+    """Связка «шаблон ТЗ ↔ нормативный акт» с порядковым номером в списке."""
+
+    __tablename__ = "template_normative_acts"
+
+    template_key: Mapped[str] = mapped_column(String, primary_key=True)
+    act_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("normative_acts.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 class TZTemplateORM(Base):
     """Каталог шаблонов ТЗ, между которыми переключается пользователь."""
 
@@ -140,6 +180,7 @@ class TZDocumentORM(Base):
     sections: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     notes: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     chat: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    storage_key: Mapped[str | None] = mapped_column(String, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

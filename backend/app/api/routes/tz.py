@@ -1,8 +1,10 @@
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
+from backend.app.core.config import settings
 from backend.app.models.domain import TZDocumentSection
 
 from backend.app.schemas.tz import (
@@ -27,10 +29,14 @@ from backend.app.core.config import settings
 from backend.app.services.assistant import assistant_service
 from backend.app.services.documents import document_export_service
 from backend.app.services.tz_chat import tz_chat_service
+from backend.app.services.storage import DOCX_MIME, get_storage_service
 from backend.app.services.tz_generator import tz_generator
 from backend.app.services.tz_repository import tz_repository
 from backend.app.services.tz_templates import tz_template_service
 from backend.app.services.tz_validation import tz_validation_service
+
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter()
@@ -223,14 +229,33 @@ async def switch_document_template(doc_id: str, payload: TZSwitchTemplateRequest
 
 @router.get("/{doc_id}/export")
 async def export_document(doc_id: str) -> FileResponse:
+    """Собирает docx, кладёт в MinIO (bucket `prostor-tz`) и отдаёт файл.
+
+    Ключ хранилища сохраняется в `tz_documents.storage_key`, чтобы позже
+    можно было переиспользовать тот же объект через presigned URL без
+    повторной генерации.
+    """
     document = await tz_repository.get(doc_id)
     if document is None:
         raise HTTPException(status_code=404, detail="ТЗ не найдено")
+
     path = document_export_service.export_docx(document)
+
+    # Заливаем в объектное хранилище; если MinIO недоступен, просто
+    # отдаём файл — не ломаем демо-путь.
+    try:
+        storage = get_storage_service()
+        key = f"{doc_id}/{path.name}"
+        await storage.aput_file(settings.s3_bucket_tz, key, path, DOCX_MIME)
+        document.storage_key = key
+        await tz_repository.update(document)
+    except Exception as exc:
+        logger.warning("MinIO upload failed for tz=%s: %s", doc_id, exc)
+
     return FileResponse(
         path=path,
         filename=path.name,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        media_type=DOCX_MIME,
     )
 
 
@@ -335,3 +360,31 @@ def _mark_applied(document, applied) -> None:
         for update in message.field_updates:
             if (update.target, update.key) in keys:
                 update.applied = True
+
+
+@router.get("/{doc_id}/download-url")
+async def download_url(doc_id: str) -> dict:
+    """Возвращает presigned URL для скачивания docx напрямую из MinIO."""
+    document = await tz_repository.get(doc_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="ТЗ не найдено")
+
+    storage = get_storage_service()
+
+    # Если ещё не выгружали — сгенерируем docx и загрузим сейчас.
+    key = document.storage_key
+    if not key:
+        path = document_export_service.export_docx(document)
+        key = f"{doc_id}/{path.name}"
+        try:
+            await storage.aput_file(settings.s3_bucket_tz, key, path, DOCX_MIME)
+            document.storage_key = key
+            await tz_repository.update(document)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Объектное хранилище недоступно: {exc}",
+            )
+
+    url = await storage.apresigned_url(settings.s3_bucket_tz, key)
+    return {"url": url, "storage_key": key, "expires_in": settings.s3_presign_ttl}
