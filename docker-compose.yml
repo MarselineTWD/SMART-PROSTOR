@@ -1,3 +1,5 @@
+name: prostor
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -15,7 +17,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-
   backend:
     build:
       context: .
