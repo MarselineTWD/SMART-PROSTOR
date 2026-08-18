@@ -140,6 +140,9 @@ class TZField(BaseModel):
     label: str
     placeholder: str = ""
     required: bool = False
+    input_type: Literal["text", "date", "number", "select", "checkbox", "textarea"] = "text"
+    options: list[str] = Field(default_factory=list)
+    group: str = "Основные данные"
 
 
 class TZTemplateSection(BaseModel):
@@ -157,6 +160,8 @@ class TZTemplate(BaseModel):
     stage_presets: list[str] = Field(default_factory=list)
     fields: list[TZField] = Field(default_factory=list)
     sections: list[TZTemplateSection] = Field(default_factory=list)
+    source_files: list[str] = Field(default_factory=list)
+    example: dict[str, Any] = Field(default_factory=dict)
 
 
 class TZDocumentSection(BaseModel):

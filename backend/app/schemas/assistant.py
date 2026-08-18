@@ -16,3 +16,12 @@ class AssistantChatRequest(BaseModel):
 
 class AssistantChatResponse(BaseModel):
     reply: str
+    provider: str = "rules"
+    model: str | None = None
+    fallback: bool = False
+
+
+class AssistantStatusResponse(BaseModel):
+    enabled: bool
+    provider: str
+    model: str

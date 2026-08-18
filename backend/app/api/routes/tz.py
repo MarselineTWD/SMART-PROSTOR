@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
+from backend.app.models.domain import TZDocumentSection
+
 from backend.app.schemas.tz import (
     TemplateDetailResponse,
     TemplatesResponse,
@@ -12,15 +14,24 @@ from backend.app.schemas.tz import (
     TZGenerateRequest,
     TZListResponse,
     TZTemplateSummary,
+    TZSwitchTemplateRequest,
+    TZValidationResult,
     TZUpdateRequest,
 )
 from backend.app.services.documents import document_export_service
 from backend.app.services.tz_generator import tz_generator
 from backend.app.services.tz_repository import tz_repository
 from backend.app.services.tz_templates import tz_template_service
+from backend.app.services.tz_validation import tz_validation_service
 
 
 router = APIRouter()
+
+
+def _document_response(document) -> TZDocumentResponse:
+    validation = tz_validation_service.validate(document)
+    document.ready_score = validation.ready_score
+    return TZDocumentResponse(document=document, validation=validation)
 
 
 # --- Шаблоны ------------------------------------------------------------------
@@ -36,6 +47,7 @@ def list_templates() -> TemplatesResponse:
                 product_id=t.product_id,
                 description=t.description,
                 section_count=len(t.sections),
+                source_files=t.source_files,
             )
             for t in templates
         ]
@@ -94,7 +106,10 @@ async def create_document(payload: TZCreateRequest) -> TZDocumentResponse:
         tz_generator.generate(document, mode="augment", template=template)
 
     await tz_repository.create(document)
-    return TZDocumentResponse(document=document)
+    validation = tz_validation_service.validate(document)
+    document.ready_score = validation.ready_score
+    await tz_repository.update(document)
+    return TZDocumentResponse(document=document, validation=validation)
 
 
 @router.get("/{doc_id}", response_model=TZDocumentResponse)
@@ -102,7 +117,7 @@ async def get_document(doc_id: str) -> TZDocumentResponse:
     document = await tz_repository.get(doc_id)
     if document is None:
         raise HTTPException(status_code=404, detail="ТЗ не найдено")
-    return TZDocumentResponse(document=document)
+    return _document_response(document)
 
 
 @router.put("/{doc_id}", response_model=TZDocumentResponse)
@@ -122,10 +137,10 @@ async def update_document(doc_id: str, payload: TZUpdateRequest) -> TZDocumentRe
     if payload.sections is not None:
         document.sections = payload.sections
 
-    document.ready_score = tz_generator.compute_ready_score(document)
+    document.ready_score = tz_validation_service.validate(document).ready_score
     document.updated_at = datetime.now(timezone.utc)
     await tz_repository.update(document)
-    return TZDocumentResponse(document=document)
+    return _document_response(document)
 
 
 @router.delete("/{doc_id}")
@@ -150,8 +165,52 @@ async def generate_document(doc_id: str, payload: TZGenerateRequest) -> TZDocume
         section_keys=payload.section_keys,
         template=template,
     )
+    validation = tz_validation_service.validate(document)
+    document.ready_score = validation.ready_score
     await tz_repository.update(document)
-    return TZDocumentResponse(document=document)
+    return TZDocumentResponse(document=document, validation=validation)
+
+
+@router.post("/{doc_id}/validate", response_model=TZValidationResult)
+async def validate_document(doc_id: str) -> TZValidationResult:
+    document = await tz_repository.get(doc_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="ТЗ не найдено")
+    validation = tz_validation_service.validate(document)
+    document.ready_score = validation.ready_score
+    await tz_repository.update(document)
+    return validation
+
+
+@router.post("/{doc_id}/switch-template", response_model=TZDocumentResponse)
+async def switch_document_template(doc_id: str, payload: TZSwitchTemplateRequest) -> TZDocumentResponse:
+    document = await tz_repository.get(doc_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="ТЗ не найдено")
+    template = tz_template_service.get_template(payload.template_key)
+    if template is None:
+        raise HTTPException(status_code=404, detail="Шаблон не найден")
+
+    previous = {section.key: section for section in document.sections}
+    document.sections = [
+        previous.get(section.key) or TZDocumentSection(
+            key=section.key, title=section.title, content="", source="template"
+        )
+        for section in template.sections
+    ]
+    for section in document.sections:
+        template_section = next((s for s in template.sections if s.key == section.key), None)
+        if template_section:
+            section.title = template_section.title
+    document.template_key = template.key
+    document.template_name = template.name
+    document.product_id = template.product_id
+    document.requisites["stages"] = list(template.stage_presets)
+    document.updated_at = datetime.now(timezone.utc)
+    validation = tz_validation_service.validate(document)
+    document.ready_score = validation.ready_score
+    await tz_repository.update(document)
+    return TZDocumentResponse(document=document, validation=validation)
 
 
 @router.get("/{doc_id}/export")

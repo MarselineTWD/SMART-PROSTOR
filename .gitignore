@@ -13,5 +13,6 @@ frontend/.vite/
 outputs/
 
 .env
+.env.secrets
 .env.*
 *.log

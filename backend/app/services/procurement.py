@@ -15,6 +15,19 @@ from pathlib import Path
 
 SEED_PATH = Path(__file__).resolve().parents[1] / "data" / "procurement_seed.json"
 
+# Числовая ставка присутствует только в эталонном «Приложении 3. РС.xlsx»:
+# 1 000 руб./рабочий день. В каталожной выгрузке перечислены роли и единицы,
+# но сами договорные ставки намеренно отсутствуют. Поэтому денежная оценка
+# показывается как индикативная и не подменяет согласованный РС.
+BASE_DAY_RATE_RUB = 1_000.0
+VAT_RATE = 0.22
+FTE_PER_ROLE = 0.9
+COST_DISCLAIMER = (
+    "Индикативная оценка: подрядчик, длительность и роли взяты из XLSX ПРОСТОР; "
+    "базовая ставка 1 000 руб./раб. день — из примера Приложения 3. РС. "
+    "В выгрузке договорные суммы отсутствуют, перед заказом ставку нужно уточнить."
+)
+
 _TOKEN_RE = re.compile(r"[а-яёa-z0-9]+")
 # Помогает связать шаблоны ТЗ (демо) с реальными продуктами выгрузки.
 _ALIASES = {
@@ -113,6 +126,46 @@ class ProcurementService:
             offset += days
         return total, out
 
+    def _cost_for_calc(self, product_id: str, calc: dict) -> dict:
+        total = self._span_days(calc)
+        workdays = max(round(total * 5 / 7), 1)
+        role_count = max(len(self.roles_by_product.get(product_id, [])), 1)
+        average_fte = round(max(role_count * FTE_PER_ROLE, 1.0), 2)
+        cost_without_vat = round(workdays * average_fte * BASE_DAY_RATE_RUB, 2)
+        return {
+            "estimated_days": total,
+            "workdays": workdays,
+            "role_count": role_count,
+            "average_fte": average_fte,
+            "cost_without_vat": cost_without_vat,
+        }
+
+    def _additional_services(self, product_id: str, company_ids: set[str]) -> list[dict]:
+        options: list[dict] = []
+        for other_id, calcs in self.calcs_by_product.items():
+            if other_id == product_id:
+                continue
+            name = self.products.get(other_id, {}).get("name") or calcs[0].get("product_name") or other_id
+            if name.upper().startswith("НЕАКТУАЛЬНО"):
+                continue
+            common = sorted(company_ids & {calc["company_id"] for calc in calcs})
+            if not common:
+                continue
+            costs = [
+                self._cost_for_calc(other_id, calc)["cost_without_vat"]
+                for calc in calcs if calc["company_id"] in common
+            ]
+            options.append({
+                "product_id": other_id,
+                "name": name,
+                "common_company_count": len(common),
+                "role_count": max(len(self.roles_by_product.get(other_id, [])), 1),
+                "operation_count": len(self.operations_by_product.get(other_id, [])),
+                "min_cost_without_vat": min(costs),
+            })
+        options.sort(key=lambda item: (-item["common_company_count"], item["min_cost_without_vat"], item["name"]))
+        return options[:12]
+
     # --- Публичное API --------------------------------------------------------
 
     def list_products(self) -> list[dict]:
@@ -134,8 +187,8 @@ class ProcurementService:
         out.sort(key=lambda r: (-r["company_count"], r["name"]))
         return out
 
-    def estimate_product(self, product_id: str) -> dict | None:
-        """Для продукта — оценка срока и роадмап по каждому подрядчику."""
+    def estimate_product(self, product_id: str, additional_product_ids: list[str] | None = None) -> dict | None:
+        """Для продукта — срок, роадмап и индикативная стоимость подрядчиков."""
         self._load()
         calcs = self.calcs_by_product.get(product_id)
         if not calcs:
@@ -144,13 +197,50 @@ class ProcurementService:
         for c in calcs:
             by_company[c["company_id"]].append(c)
 
+        company_ids = set(by_company)
+        available_additional_services = self._additional_services(product_id, company_ids)
+        allowed_additional_ids = {item["product_id"] for item in available_additional_services}
+        selected_additional_ids = [
+            item for item in dict.fromkeys(additional_product_ids or []) if item in allowed_additional_ids
+        ]
+
         companies = []
+        product_roles = sorted(self.roles_by_product.get(product_id, []))
+        role_count = max(len(product_roles), 1)
         for cid, comp_calcs in by_company.items():
             rep = max(comp_calcs, key=lambda c: (len(self.stages_by_calc.get(c["calc_id"], [])), self._span_days(c)))
             spans = [self._span_days(c) for c in comp_calcs]
             total, roadmap = self._build_roadmap(rep)
             info = self.companies.get(cid, {})
             contract = self.contracts.get(rep.get("contract_id") or "", {})
+            workdays = max(round(total * 5 / 7), 1)
+            average_fte = round(max(role_count * FTE_PER_ROLE, 1.0), 2)
+            cost_without_vat = round(workdays * average_fte * BASE_DAY_RATE_RUB, 2)
+            base_cost_without_vat = cost_without_vat
+            selected_services = []
+            for additional_id in selected_additional_ids:
+                candidate_calcs = [
+                    calc for calc in self.calcs_by_product.get(additional_id, [])
+                    if calc["company_id"] == cid
+                ]
+                if not candidate_calcs:
+                    continue
+                additional_calc = min(candidate_calcs, key=self._span_days)
+                additional_cost = self._cost_for_calc(additional_id, additional_calc)
+                additional_name = self.products.get(additional_id, {}).get("name") or additional_calc.get("product_name") or additional_id
+                selected_services.append({
+                    "product_id": additional_id,
+                    "name": additional_name,
+                    "estimated_days": additional_cost["estimated_days"],
+                    "cost_without_vat": additional_cost["cost_without_vat"],
+                })
+            additional_cost_without_vat = round(sum(item["cost_without_vat"] for item in selected_services), 2)
+            cost_without_vat = round(base_cost_without_vat + additional_cost_without_vat, 2)
+            vat_amount = round(cost_without_vat * VAT_RATE, 2)
+            for stage in roadmap:
+                stage["estimated_cost_without_vat"] = round(
+                    base_cost_without_vat * stage["percent"] / 100, 2
+                )
             companies.append({
                 "company_id": cid,
                 "company_name": info.get("name", cid),
@@ -168,16 +258,36 @@ class ProcurementService:
                 "variants": len(comp_calcs),
                 "stage_count": len(roadmap),
                 "stages": roadmap,
+                "workdays": workdays,
+                "role_count": role_count,
+                "average_fte": average_fte,
+                "base_day_rate_rub": BASE_DAY_RATE_RUB,
+                "cost_without_vat": cost_without_vat,
+                "vat_rate": VAT_RATE,
+                "vat_amount": vat_amount,
+                "cost_with_vat": round(cost_without_vat + vat_amount, 2),
+                "cost_basis": COST_DISCLAIMER,
+                "cost_confidence": "indicative",
+                "base_cost_without_vat": base_cost_without_vat,
+                "additional_cost_without_vat": additional_cost_without_vat,
+                "additional_services": selected_services,
             })
-        companies.sort(key=lambda r: (r["estimated_days"], -(r["rating"] or 0)))
+        companies.sort(key=lambda r: (r["cost_without_vat"], r["estimated_days"], -(r["rating"] or 0)))
 
         days = [c["estimated_days"] for c in companies]
+        costs = [c["cost_without_vat"] for c in companies]
         summary = {
             "company_count": len(companies),
             "fastest_days": min(days),
             "slowest_days": max(days),
             "average_days": round(sum(days) / len(days)),
-            "fastest_company": companies[0]["company_name"],
+            "fastest_company": min(companies, key=lambda c: c["estimated_days"])["company_name"],
+            "lowest_cost_without_vat": min(costs),
+            "highest_cost_without_vat": max(costs),
+            "average_cost_without_vat": round(sum(costs) / len(costs), 2),
+            "lowest_cost_company": min(companies, key=lambda c: c["cost_without_vat"])["company_name"],
+            "vat_rate": VAT_RATE,
+            "cost_disclaimer": COST_DISCLAIMER,
         }
         return {
             "product_id": product_id,
@@ -186,6 +296,8 @@ class ProcurementService:
             "roles": sorted(self.roles_by_product.get(product_id, [])),
             "companies": companies,
             "summary": summary,
+            "available_additional_services": available_additional_services,
+            "selected_additional_product_ids": selected_additional_ids,
         }
 
     def match_products(self, query: str, limit: int = 5) -> list[dict]:

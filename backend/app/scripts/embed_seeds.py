@@ -18,6 +18,17 @@ from backend.app.services.embeddings import get_embeddings_service
 logger = logging.getLogger(__name__)
 
 
+async def _has_missing_embeddings(session) -> bool:
+    """Avoid loading the ML model when the database is already backfilled."""
+    for entity_cls in (Product, Company, HistoricalCase, IntentPrompt):
+        result = await session.execute(
+            select(entity_cls.id).where(entity_cls.embedding.is_(None)).limit(1)
+        )
+        if result.scalar_one_or_none() is not None:
+            return True
+    return False
+
+
 def _product_text(p: Product) -> str:
     parts = [p.name, p.summary]
     if p.keywords:
@@ -53,6 +64,12 @@ async def _embed_missing(session, model, entity_cls, text_fn) -> int:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
+
+    async with SessionLocal() as session:
+        if not await _has_missing_embeddings(session):
+            logger.info("Embeddings are up to date; model loading skipped.")
+            return
+
     logger.info("Loading embedding model...")
     model = get_embeddings_service()
     logger.info("Model ready.")

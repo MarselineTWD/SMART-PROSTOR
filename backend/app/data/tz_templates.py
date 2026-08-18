@@ -72,21 +72,33 @@ CANONICAL_SECTIONS: dict[str, dict[str, str]] = {
 
 # --- Реквизиты формы (общие поля шапки/подписей) -----------------------------
 
-def _field(key: str, label: str, placeholder: str = "", required: bool = False) -> dict:
-    return {"key": key, "label": label, "placeholder": placeholder, "required": required}
+def _field(
+    key: str,
+    label: str,
+    placeholder: str = "",
+    required: bool = False,
+    *,
+    input_type: str = "text",
+    options: list[str] | None = None,
+    group: str = "Основные данные",
+) -> dict:
+    return {
+        "key": key, "label": label, "placeholder": placeholder, "required": required,
+        "input_type": input_type, "options": options or [], "group": group,
+    }
 
 
 COMMON_FIELDS: list[dict] = [
-    _field("contract_number", "Номер договора", "{Номер-Договора}"),
-    _field("contract_date", "Дата договора", "дд.мм.гггг"),
-    _field("object_name", "Объект / месторождение", "Название месторождения", required=True),
-    _field("customer_name", "Заказчик (полное наименование)", "АО «...»", required=True),
-    _field("executor_name", "Исполнитель", "ООО «...»"),
-    _field("city", "Место выполнения работ", "г. Тюмень"),
-    _field("start_date", "Начало работ", "дд.мм.гггг"),
-    _field("end_date", "Окончание работ", "дд.мм.гггг"),
-    _field("signatory_customer", "Подписант Заказчика", "Должность, ФИО"),
-    _field("signatory_executor", "Подписант Исполнителя", "Должность, ФИО"),
+    _field("contract_number", "Номер договора", "{Номер-Договора}", group="Договор"),
+    _field("contract_date", "Дата договора", input_type="date", group="Договор"),
+    _field("object_name", "Объект / месторождение", "Название месторождения", required=True, group="Объект и стороны"),
+    _field("customer_name", "Заказчик (полное наименование)", "АО «...»", required=True, group="Объект и стороны"),
+    _field("executor_name", "Исполнитель", "ООО «...»", group="Объект и стороны"),
+    _field("city", "Место выполнения работ", "г. Тюмень", group="Объект и стороны"),
+    _field("start_date", "Начало работ", input_type="date", group="Сроки договора"),
+    _field("end_date", "Окончание работ", input_type="date", group="Сроки договора"),
+    _field("signatory_customer", "Подписант Заказчика", "Должность, ФИО", group="Подписание"),
+    _field("signatory_executor", "Подписант Исполнителя", "Должность, ФИО", group="Подписание"),
 ]
 
 
@@ -300,6 +312,92 @@ TZ_TEMPLATES: list[dict] = [
 
 
 DEFAULT_TEMPLATE_KEY = "tz-universal"
+
+
+_TEMPLATE_SOURCE_FILES = {
+    "tz-ptd-reserves": ["Прил 1_ТЗ_ПТД.docx"],
+    "tz-ptd-new-field": ["Приложение 1. ТЗ (ПЗ Нового м-я).docx"],
+    "tz-ptd-do": ["Приложение 1. ТЗ (шаблон ПТД ДО)_2026.docx"],
+    "tz-ptd-nng": ["Приложение 1. ТЗ (шаблон ПТД ННГ)_2026.docx"],
+    "tz-ptd-opz": ["Приложение 3. ТЗ ПТД_ОПЗ УВС Песц НГКМ.docx"],
+    "tz-geology-concept": ["ТЗ Концепт геологии.docx"],
+    "tz-arrangement-concept": ["ТЗ Концепт обустройства.docx"],
+    "tz-integrated-development": ["ТЗ Интегрированный концепт развития.docx"],
+    "tz-integrated-completion": ["ТЗ Интегрированный концепт заканчивания.docx"],
+    "tz-engineering-support": ["ТЗ Сопровождение инженерных работ и высокорисковых операций.docx"],
+    "tz-universal": ["Приложение № 2.1 Форма Технического задания.docx", "Приложение 1. ТЗ.docx"],
+}
+
+for _template in TZ_TEMPLATES:
+    _template["source_files"] = _TEMPLATE_SOURCE_FILES.get(_template["key"], [])
+
+
+_TEMPLATE_EXTRA_FIELDS = {
+    "tz-ptd-reserves": [
+        _field("reserve_standard", "Стандарт оценки запасов", required=True, input_type="select", options=["ГКЗ РФ", "SEC", "PRMS"], group="Параметры ПТД"),
+        _field("license_area", "Лицензионный участок", "Наименование участка", group="Параметры ПТД"),
+        _field("model_dimension", "Тип модели", input_type="select", options=["2D", "3D"], group="Параметры ПТД"),
+    ],
+    "tz-ptd-new-field": [
+        _field("field_maturity", "Стадия изученности месторождения", input_type="select", options=["Поисковая", "Разведочная", "Опытно-промышленная"], group="Новое месторождение"),
+        _field("reserve_standard", "Стандарт оценки запасов", required=True, input_type="select", options=["ГКЗ РФ", "SEC", "PRMS"], group="Новое месторождение"),
+    ],
+    "tz-ptd-do": [
+        _field("subsidiary_name", "Дочернее общество", required=True, group="Периметр ДО"),
+        _field("corporate_standard", "Корпоративный стандарт", "Шифр НМД", group="Периметр ДО"),
+    ],
+    "tz-ptd-nng": [
+        _field("asset_code", "Код актива ННГ", required=True, group="Периметр ННГ"),
+        _field("reserve_standard", "Стандарт оценки запасов", input_type="select", options=["ГКЗ РФ", "SEC", "PRMS"], group="Периметр ННГ"),
+    ],
+    "tz-ptd-opz": [
+        _field("recalculation_reason", "Основание оперативного пересчёта", required=True, input_type="textarea", group="Параметры ОПЗ"),
+        _field("regulator_deadline", "Срок подачи регулятору", input_type="date", group="Параметры ОПЗ"),
+    ],
+    "tz-geology-concept": [
+        _field("study_area_km2", "Площадь исследований, км²", input_type="number", group="Геологические параметры"),
+        _field("target_horizons", "Целевые горизонты", "Пласты и интервалы", required=True, group="Геологические параметры"),
+        _field("interpretation_depth", "Глубина интерпретации, м", input_type="number", group="Геологические параметры"),
+    ],
+    "tz-arrangement-concept": [
+        _field("concept_variants", "Количество вариантов концепта", input_type="number", required=True, group="Вариантная проработка"),
+        _field("infrastructure_scope", "Объекты инфраструктуры", input_type="textarea", group="Вариантная проработка"),
+    ],
+    "tz-integrated-development": [
+        _field("scenario_count", "Количество сценариев развития", input_type="number", required=True, group="Сценарный анализ"),
+        _field("economic_horizon", "Горизонт оценки, лет", input_type="number", group="Сценарный анализ"),
+    ],
+    "tz-integrated-completion": [
+        _field("well_count", "Количество скважин", input_type="number", required=True, group="Заканчивание"),
+        _field("completion_type", "Тип заканчивания", input_type="select", options=["Открытый ствол", "Обсаженный ствол", "Многостадийный ГРП", "Комбинированный"], group="Заканчивание"),
+    ],
+    "tz-engineering-support": [
+        _field("risk_level", "Уровень риска операций", required=True, input_type="select", options=["Средний", "Высокий", "Критический"], group="Риск-профиль"),
+        _field("supervision_mode", "Формат сопровождения", input_type="select", options=["Очный", "Удалённый", "Гибридный"], group="Риск-профиль"),
+        _field("operation_window", "Окно проведения операции", input_type="date", group="Риск-профиль"),
+    ],
+    "tz-universal": [
+        _field("work_basis", "Основание выполнения работ", input_type="textarea", group="Дополнительные реквизиты"),
+        _field("result_format", "Формат итогового результата", input_type="select", options=["Отчёт", "Модель", "Заключение", "Комплект документов"], group="Дополнительные реквизиты"),
+    ],
+}
+
+_TEMPLATE_EXAMPLES = {
+    key: {
+        "title": template["name"].replace("ТЗ: ", ""),
+        "object_name": "Месторождение Северное",
+        "customer_name": "Блок геологии и разработки",
+        "goal": template["description"],
+        "deadline": "2026-12-20",
+        "stages": template["stage_presets"],
+        "result": f"Заполненное ТЗ по форме «{template['name']}» с проверенными реквизитами, этапами и ожидаемыми результатами.",
+    }
+    for key, template in ((item["key"], item) for item in TZ_TEMPLATES)
+}
+
+for _template in TZ_TEMPLATES:
+    _template["fields"].extend(deepcopy(_TEMPLATE_EXTRA_FIELDS.get(_template["key"], [])))
+    _template["example"] = deepcopy(_TEMPLATE_EXAMPLES[_template["key"]])
 
 
 def get_template(key: str) -> dict | None:

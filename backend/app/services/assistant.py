@@ -1,8 +1,39 @@
 ﻿from backend.app.schemas.assistant import AssistantChatRequest
 
 
+import json
+
+from backend.app.core.config import settings
+from backend.app.schemas.assistant import AssistantChatResponse
+from backend.app.services.llm import llm_complete
+
+
 class AssistantService:
-    def reply(self, payload: AssistantChatRequest) -> str:
+    def reply(self, payload: AssistantChatRequest) -> AssistantChatResponse:
+        llm_reply = self._llm_reply(payload)
+        if llm_reply:
+            return AssistantChatResponse(
+                reply=llm_reply, provider="deepseek", model=settings.llm_model, fallback=False
+            )
+        return AssistantChatResponse(
+            reply=self._fallback_reply(payload), provider="rules", model=None,
+            fallback=settings.llm_enabled,
+        )
+
+    def _llm_reply(self, payload: AssistantChatRequest) -> str | None:
+        history = "\n".join(f"{item.role}: {item.text}" for item in payload.history[-8:])
+        context = json.dumps(payload.context or {}, ensure_ascii=False, default=str)
+        system = (
+            "Ты — помощник конструктора технических заданий ПРОСТОР для нефтегазовых работ. "
+            "Отвечай на русском кратко и конкретно. Опирайся только на переданный контекст. "
+            "Не придумывай договорные ставки, факты и результаты проверок. "
+            "Если есть validation_issues, сначала объясни критичные замечания и предложи исправления. "
+            "Денежные оценки называй индикативными, если договорные ставки отсутствуют."
+        )
+        prompt = f"Контекст:\n{context}\nИстория:\n{history}\nЗапрос пользователя:\n{payload.message}"
+        return llm_complete(system, prompt, temperature=0.2)
+
+    def _fallback_reply(self, payload: AssistantChatRequest) -> str:
         message = payload.message.lower()
         context = payload.context or {}
         draft = context.get("draft") or {}

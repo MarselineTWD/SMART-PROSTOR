@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from backend.app.schemas.estimate import (
     MatchResponse,
@@ -24,8 +24,11 @@ def match(q: str, limit: int = 5) -> MatchResponse:
 
 
 @router.get("/products/{product_id}", response_model=ProductEstimateResponse)
-def product_estimate(product_id: str) -> ProductEstimateResponse:
-    estimate = procurement_service.estimate_product(product_id)
+def product_estimate(
+    product_id: str,
+    additional_product_ids: list[str] = Query(default=[]),
+) -> ProductEstimateResponse:
+    estimate = procurement_service.estimate_product(product_id, additional_product_ids)
     if estimate is None:
         raise HTTPException(status_code=404, detail="Для продукта нет расчётов стоимости")
     return estimate
