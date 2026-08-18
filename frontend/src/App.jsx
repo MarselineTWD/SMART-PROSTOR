@@ -1024,3 +1024,7 @@ function ReasonList({ title, items }) {
     </InfoGroup>
   );
 }
+
+function EmptyState({ text }) {
+  return <p className="empty-state">{text}</p>;
+}
