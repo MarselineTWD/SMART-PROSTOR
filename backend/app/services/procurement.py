@@ -596,4 +596,301 @@ class ProcurementService:
         }
 
 
+    # --- Аналитика по подрядчикам --------------------------------------------
+
+    def _company_stats(self, company_id: str) -> dict:
+        """Собирает срезы по одному подрядчику из всех calcs/stages/prices."""
+        info = self.companies.get(company_id) or {}
+        calcs = [
+            c
+            for cs in self.calcs_by_product.values()
+            for c in cs
+            if c.get("company_id") == company_id
+        ]
+        contract_ids = {c["contract_id"] for c in calcs if c.get("contract_id")}
+        product_ids = {c["product_id"] for c in calcs if c.get("product_id")}
+        spans = [self._span_days(c) for c in calcs]
+
+        # Продуктовая линейка: сколько заказов по каждому продукту + сумма стоимости.
+        by_product: dict[str, dict] = {}
+        for c in calcs:
+            pid = c["product_id"]
+            entry = by_product.setdefault(
+                pid,
+                {
+                    "product_id": pid,
+                    "product_name": self.products.get(pid, {}).get("name")
+                    or c.get("product_name")
+                    or pid,
+                    "orders": 0,
+                    "total_days": 0,
+                    "total_cost_without_vat": 0.0,
+                },
+            )
+            days = self._span_days(c)
+            workdays = max(round(days * WORKDAYS_PER_CALENDAR), 1)
+            cost = self._cost_breakdown(pid, workdays)["cost_without_vat"]
+            entry["orders"] += 1
+            entry["total_days"] += days
+            entry["total_cost_without_vat"] += cost
+        products_list = sorted(
+            by_product.values(),
+            key=lambda item: (-item["orders"], -item["total_cost_without_vat"]),
+        )
+        for entry in products_list:
+            entry["total_cost_without_vat"] = round(entry["total_cost_without_vat"], 2)
+
+        # Итоги
+        total_days = sum(spans)
+        total_cost_without_vat = round(
+            sum(entry["total_cost_without_vat"] for entry in products_list), 2
+        )
+        total_workdays = max(round(total_days * WORKDAYS_PER_CALENDAR), 0)
+        total_stages = sum(len(self.stages_by_calc.get(c["calc_id"], [])) for c in calcs)
+
+        # Заказы, «пересекающиеся во времени» — максимум параллельных.
+        intervals: list[tuple[date, date]] = []
+        for c in calcs:
+            s, e = _pdate(c.get("start_date")), _pdate(c.get("end_date"))
+            if s and e and e > s:
+                intervals.append((s, e))
+        max_concurrent = 0
+        if intervals:
+            events = []
+            for s, e in intervals:
+                events.append((s, 1))
+                events.append((e, -1))
+            events.sort()
+            running = 0
+            for _, delta in events:
+                running += delta
+                max_concurrent = max(max_concurrent, running)
+
+        return {
+            "company_id": company_id,
+            "company_name": info.get("name", company_id),
+            "rating": info.get("rating"),
+            "info": info.get("info", ""),
+            "services": info.get("services", ""),
+            "order_count": len(calcs),
+            "contract_count": len(contract_ids),
+            "product_count": len(product_ids),
+            "stage_count": total_stages,
+            "avg_days_per_order": round(sum(spans) / len(spans), 1) if spans else 0.0,
+            "min_days_per_order": min(spans) if spans else 0,
+            "max_days_per_order": max(spans) if spans else 0,
+            "total_calendar_days": total_days,
+            "total_workdays": total_workdays,
+            "total_cost_without_vat": total_cost_without_vat,
+            "total_cost_with_vat": round(total_cost_without_vat * (1 + VAT_RATE), 2),
+            "avg_cost_per_order": round(total_cost_without_vat / len(calcs), 2) if calcs else 0.0,
+            "max_concurrent_orders": max_concurrent,
+            "products": products_list,
+        }
+
+    def contractor_leaderboard(self) -> dict:
+        """Сводная аналитика по всем подрядчикам (топ-борды + доля рынка)."""
+        self._load()
+        stats = [self._company_stats(cid) for cid in sorted(self.companies)]
+
+        total_orders = sum(s["order_count"] for s in stats)
+        total_cost = sum(s["total_cost_without_vat"] for s in stats)
+        total_days = sum(s["total_calendar_days"] for s in stats)
+
+        def _rank(key: str, top: int = 5, reverse: bool = True) -> list[dict]:
+            return [
+                {
+                    "company_id": s["company_id"],
+                    "company_name": s["company_name"],
+                    "rating": s["rating"],
+                    "value": s[key],
+                }
+                for s in sorted(stats, key=lambda item: item[key], reverse=reverse)[:top]
+            ]
+
+        market_share = [
+            {
+                "company_id": s["company_id"],
+                "company_name": s["company_name"],
+                "orders": s["order_count"],
+                "orders_share": round(s["order_count"] / total_orders, 4) if total_orders else 0,
+                "cost_without_vat": s["total_cost_without_vat"],
+                "cost_share": round(s["total_cost_without_vat"] / total_cost, 4) if total_cost else 0,
+                "days": s["total_calendar_days"],
+                "days_share": round(s["total_calendar_days"] / total_days, 4) if total_days else 0,
+            }
+            for s in stats
+        ]
+        market_share.sort(key=lambda item: item["cost_share"], reverse=True)
+
+        summary = {
+            "total_contractors": len(stats),
+            "total_orders": total_orders,
+            "total_calendar_days": total_days,
+            "total_cost_without_vat": round(total_cost, 2),
+            "average_orders_per_contractor": round(total_orders / len(stats), 2) if stats else 0,
+            "average_cost_per_contractor": round(total_cost / len(stats), 2) if stats else 0,
+            "average_rating": round(
+                sum(s["rating"] or 0 for s in stats) / len(stats), 2
+            ) if stats else 0,
+            "cost_disclaimer": COST_DISCLAIMER,
+            "vat_rate": VAT_RATE,
+        }
+
+        return {
+            "summary": summary,
+            "top_by_orders": _rank("order_count"),
+            "top_by_cost_without_vat": _rank("total_cost_without_vat"),
+            "top_by_calendar_days": _rank("total_calendar_days"),
+            "top_by_rating": _rank("rating"),
+            "top_by_avg_cost_per_order": _rank("avg_cost_per_order"),
+            "top_by_avg_days_per_order": _rank("avg_days_per_order", reverse=False),
+            "market_share": market_share,
+        }
+
+    def contractor_profile(self, company_id: str) -> dict | None:
+        """Полный профиль подрядчика: продукты, договоры, средние показатели."""
+        self._load()
+        if company_id not in self.companies:
+            return None
+        stats = self._company_stats(company_id)
+
+        # Договоры с подсчётом заказов и суммарной стоимости.
+        contracts_map: dict[str, dict] = {}
+        for cs in self.calcs_by_product.values():
+            for c in cs:
+                if c.get("company_id") != company_id:
+                    continue
+                cid = c.get("contract_id")
+                if not cid:
+                    continue
+                entry = contracts_map.setdefault(
+                    cid,
+                    {
+                        "contract_id": cid,
+                        "number": self.contracts.get(cid, {}).get("number", ""),
+                        "orders": 0,
+                        "total_days": 0,
+                        "total_cost_without_vat": 0.0,
+                    },
+                )
+                days = self._span_days(c)
+                workdays = max(round(days * WORKDAYS_PER_CALENDAR), 1)
+                cost = self._cost_breakdown(c["product_id"], workdays)["cost_without_vat"]
+                entry["orders"] += 1
+                entry["total_days"] += days
+                entry["total_cost_without_vat"] += cost
+        contracts_list = sorted(
+            contracts_map.values(), key=lambda item: -item["orders"]
+        )
+        for entry in contracts_list:
+            entry["total_cost_without_vat"] = round(entry["total_cost_without_vat"], 2)
+
+        return {**stats, "contracts": contracts_list}
+
+    def contractor_workload(self, company_id: str) -> dict | None:
+        """Помесячный график загрузки подрядчика — сколько активных заказов в каждом месяце.
+
+        Полезно для UI-графика загрузки: столбики по месяцам, height = число
+        одновременно активных заказов. Также возвращаем поштучный список
+        активных заказов (для tooltips / диаграммы Ганта верхнего уровня).
+        """
+        self._load()
+        if company_id not in self.companies:
+            return None
+        orders: list[dict] = []
+        for cs in self.calcs_by_product.values():
+            for c in cs:
+                if c.get("company_id") != company_id:
+                    continue
+                s, e = _pdate(c.get("start_date")), _pdate(c.get("end_date"))
+                if not s or not e:
+                    continue
+                orders.append({
+                    "calc_id": c["calc_id"],
+                    "product_id": c["product_id"],
+                    "product_name": self.products.get(c["product_id"], {}).get("name")
+                    or c.get("product_name")
+                    or "",
+                    "name": c.get("name", ""),
+                    "start_date": s.isoformat(),
+                    "end_date": e.isoformat(),
+                    "days": (e - s).days,
+                })
+
+        # По месяцам: сколько заказов активны хотя бы один день месяца.
+        buckets: dict[str, int] = {}
+        for o in orders:
+            s = date.fromisoformat(o["start_date"])
+            e = date.fromisoformat(o["end_date"])
+            cursor = date(s.year, s.month, 1)
+            while cursor <= e:
+                key = f"{cursor.year:04d}-{cursor.month:02d}"
+                buckets[key] = buckets.get(key, 0) + 1
+                # шаг +1 месяц
+                if cursor.month == 12:
+                    cursor = date(cursor.year + 1, 1, 1)
+                else:
+                    cursor = date(cursor.year, cursor.month + 1, 1)
+
+        monthly = [
+            {"month": key, "active_orders": count}
+            for key, count in sorted(buckets.items())
+        ]
+        info = self.companies[company_id]
+        return {
+            "company_id": company_id,
+            "company_name": info.get("name", company_id),
+            "total_orders_with_dates": len(orders),
+            "monthly_load": monthly,
+            "orders": sorted(orders, key=lambda o: o["start_date"]),
+        }
+
+    def contractor_product_matrix(self) -> dict:
+        """Матрица «подрядчик × продукт»: кто на чём специализируется."""
+        self._load()
+        rows: list[dict] = []
+        for cid, info in self.companies.items():
+            per_product: list[dict] = []
+            for pid, cs in self.calcs_by_product.items():
+                orders = [c for c in cs if c.get("company_id") == cid]
+                if not orders:
+                    continue
+                per_product.append({
+                    "product_id": pid,
+                    "product_name": self.products.get(pid, {}).get("name")
+                    or orders[0].get("product_name")
+                    or pid,
+                    "orders": len(orders),
+                })
+            per_product.sort(key=lambda item: -item["orders"])
+            if per_product:
+                rows.append({
+                    "company_id": cid,
+                    "company_name": info.get("name", cid),
+                    "rating": info.get("rating"),
+                    "product_count": len(per_product),
+                    "products": per_product,
+                })
+        rows.sort(key=lambda item: -item["product_count"])
+
+        # Обратный срез — по продукту, сколько подрядчиков умеют его делать.
+        product_coverage: list[dict] = []
+        for pid, cs in self.calcs_by_product.items():
+            companies = {c["company_id"] for c in cs if c.get("company_id")}
+            product_coverage.append({
+                "product_id": pid,
+                "product_name": self.products.get(pid, {}).get("name")
+                or (cs[0].get("product_name") if cs else pid),
+                "contractor_count": len(companies),
+                "order_count": len(cs),
+            })
+        product_coverage.sort(key=lambda item: (-item["contractor_count"], -item["order_count"]))
+
+        return {
+            "contractors": rows,
+            "product_coverage": product_coverage,
+        }
+
+
 procurement_service = ProcurementService()
