@@ -28,6 +28,12 @@ class RoadmapStage(BaseModel):
     start_date: str | None = None
     end_date: str | None = None
     estimated_cost_without_vat: float = 0
+    # Сезонные ограничения (какие работы можно вести только в определённые месяцы).
+    allowed_months: list[int] = []          # 1–12; пусто = без ограничений (круглогодично)
+    constraint_season: str = ""             # "", "winter", "summer"
+    constraint_label: str = ""              # человекочитаемая метка окна работ
+    constraint_reason: str = ""             # почему есть ограничение
+    gap_days: int = 0                       # простой перед этапом в ожидании допустимого сезона
 
 
 class ContractorEstimate(BaseModel):
@@ -47,6 +53,11 @@ class ContractorEstimate(BaseModel):
     variants: int
     stage_count: int
     stages: list[RoadmapStage] = []
+    # Календарный план с учётом сезонных ограничений (для диаграммы Ганта).
+    plan_start: str | None = None
+    plan_end: str | None = None
+    calendar_days: int = 0                  # длительность плана по календарю (с простоями)
+    season_wait_days: int = 0               # суммарный простой из-за сезонных окон
     workdays: int
     role_count: int
     average_fte: float

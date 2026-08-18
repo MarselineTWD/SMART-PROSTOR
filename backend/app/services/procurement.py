@@ -55,6 +55,89 @@ def _pdate(value: str | None) -> date | None:
         return None
 
 
+# --- Сезонные ограничения выполнения работ -----------------------------------
+# Часть нефтесервисных работ можно проводить только в определённые месяцы:
+# полевые/сейсморазведочные — по зимникам и промёрзшему грунту, завоз грузов —
+# только в навигацию. Планировщик роадмапа сдвигает старт таких этапов к
+# ближайшему допустимому месяцу и показывает ожидание сезона на диаграмме Ганта.
+# Правила data-driven: ключевые слова матчатся по названию этапа; пользователь
+# может переопределить сезон явно через requisites.stage_constraints.
+_WINTER_MONTHS = [11, 12, 1, 2, 3]        # ноябрь–март
+_NAVIGATION_MONTHS = [6, 7, 8, 9, 10]     # июнь–октябрь
+
+SEASONAL_RULES: list[dict] = [
+    {
+        "id": "winter-field",
+        "season": "winter",
+        "allowed_months": _WINTER_MONTHS,
+        "label": "Зимний период (зимник), ноя–мар",
+        "reason": (
+            "Полевые, сейсморазведочные и геологоразведочные работы в "
+            "заболоченных районах доступны только по зимникам и промёрзшему "
+            "грунту (ноябрь–март)."
+        ),
+        "keywords": [
+            "полев", "сейсморазвед", "сейсмосъ", "сейсмическ съ", "грр",
+            "геологоразвед", "изыскан", "рекогносц", "отбор керна", "керноотбор",
+            "снегосъ", "аэросъ",
+        ],
+    },
+    {
+        "id": "summer-navigation",
+        "season": "summer",
+        "allowed_months": _NAVIGATION_MONTHS,
+        "label": "Летняя навигация, июн–окт",
+        "reason": (
+            "Доставка грузов и крупногабаритного оборудования водным "
+            "транспортом возможна только в период навигации (июнь–октябрь)."
+        ),
+        "keywords": [
+            "навигац", "завоз", "водн транспорт", "баржа", "паром",
+            "речн перевоз", "морск перевоз", "доставк оборуд",
+        ],
+    },
+]
+_RULES_BY_SEASON = {rule["season"]: rule for rule in SEASONAL_RULES}
+_RULES_BY_ID = {rule["id"]: rule for rule in SEASONAL_RULES}
+_NO_CONSTRAINT = {"", "none", "нет", "любой", "круглогодично", "year", "any"}
+
+
+def _resolve_constraint(name: str, override: object | None = None) -> dict | None:
+    """Определяет сезонное окно этапа: сначала явный override, затем по названию."""
+    if override is not None:
+        season = override.get("season") if isinstance(override, dict) else override
+        season = str(season or "").strip().lower()
+        if season in _NO_CONSTRAINT:
+            return None
+        rule = _RULES_BY_SEASON.get(season) or _RULES_BY_ID.get(season)
+        if rule:
+            return rule
+    text = (name or "").lower()
+    for rule in SEASONAL_RULES:
+        if any(keyword in text for keyword in rule["keywords"]):
+            return rule
+    return None
+
+
+def _next_allowed_start(current: date, allowed_months: list[int]) -> date:
+    """Ближайшая дата ≥ current, попадающая в разрешённые месяцы.
+
+    Если текущий месяц запрещён — переносим старт на 1-е число ближайшего
+    допустимого месяца (это и есть простой в ожидании сезона).
+    """
+    if not allowed_months or current.month in allowed_months:
+        return current
+    year, month = current.year, current.month
+    for _ in range(24):
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+        if month in allowed_months:
+            return date(year, month, 1)
+    return current
+
+
+
 class ProcurementService:
     def __init__(self) -> None:
         self._loaded = False
@@ -131,19 +214,26 @@ class ProcurementService:
         calc: dict,
         stage_names: list[str],
         plan_start: str | None = None,
+        constraints: dict | None = None,
     ) -> tuple[int, list[dict]]:
-        """Распределяет срок подрядчика только по этапам пользовательского ТЗ.
+        """Распределяет срок подрядчика по этапам ТЗ с учётом сезонных окон.
 
         XLSX используется для оценки общей длительности подрядчика. Названия и
         количество этапов берутся из сохранённого ТЗ, а не из исторического РС.
         Если число исторических и пользовательских этапов совпадает, сохраняем
         исторические пропорции; иначе делим срок поровну и явно не выдумываем
         отсутствующую в исходных данных детализацию.
+
+        Дополнительно: если у этапа есть сезонное ограничение (полевые работы —
+        только зимой, завоз — только в навигацию), его старт переносится к
+        ближайшему допустимому месяцу. Возникающий простой фиксируется в
+        ``gap_days`` — это делает календарный план реалистичным.
         """
         names = [str(name).strip() for name in stage_names if str(name).strip()]
         if not names:
             return self._span_days(calc), []
 
+        constraints = constraints or {}
         total = max(self._span_days(calc), len(names))
         historical = sorted(
             self.stages_by_calc.get(calc["calc_id"], []),
@@ -160,27 +250,45 @@ class ProcurementService:
         weight_sum = sum(weights)
         start = _pdate(plan_start) or date.today()
         out: list[dict] = []
-        offset = 0
         remaining = total
+        cursor = start
         for index, (name, weight) in enumerate(zip(names, weights)):
             stages_left = len(names) - index - 1
             days = remaining if stages_left == 0 else max(1, round(total * weight / weight_sum))
             days = min(days, remaining - stages_left)
+
+            override = (
+                constraints.get(name)
+                or constraints.get(str(index))
+                or constraints.get(index)
+            )
+            rule = _resolve_constraint(name, override)
+            allowed = list(rule["allowed_months"]) if rule else []
+            stage_start = _next_allowed_start(cursor, allowed)
+            gap_days = (stage_start - cursor).days
+            stage_end = stage_start + timedelta(days=days)
+
             historical_item = historical[index] if len(historical) == len(names) else {}
             out.append({
                 "order": index + 1,
                 "name": name,
                 "days": days,
                 "weeks": round(days / 7, 1),
-                "offset_days": offset,
+                "offset_days": (stage_start - start).days,
                 "percent": round(days * 100 / total, 1),
                 "documentation": historical_item.get("documentation") or "",
-                "start_date": (start + timedelta(days=offset)).isoformat(),
-                "end_date": (start + timedelta(days=offset + days)).isoformat(),
+                "start_date": stage_start.isoformat(),
+                "end_date": stage_end.isoformat(),
+                "allowed_months": allowed,
+                "constraint_season": rule["season"] if rule else "",
+                "constraint_label": rule["label"] if rule else "",
+                "constraint_reason": rule["reason"] if rule else "",
+                "gap_days": gap_days,
             })
-            offset += days
+            cursor = stage_end
             remaining -= days
         return total, out
+
 
     def _cost_for_calc(self, product_id: str, calc: dict) -> dict:
         total = self._span_days(calc)
@@ -250,6 +358,7 @@ class ProcurementService:
         *,
         roadmap_stages: list[str] | None = None,
         plan_start: str | None = None,
+        roadmap_constraints: dict | None = None,
     ) -> dict | None:
         """Для продукта — срок, роадмап и индикативная стоимость подрядчиков."""
         self._load()
@@ -274,7 +383,7 @@ class ProcurementService:
             rep = max(comp_calcs, key=lambda c: (len(self.stages_by_calc.get(c["calc_id"], [])), self._span_days(c)))
             spans = [self._span_days(c) for c in comp_calcs]
             total, roadmap = (
-                self._build_tz_roadmap(rep, roadmap_stages, plan_start)
+                self._build_tz_roadmap(rep, roadmap_stages, plan_start, roadmap_constraints)
                 if roadmap_stages
                 else self._build_roadmap(rep)
             )
@@ -308,6 +417,20 @@ class ProcurementService:
                 stage["estimated_cost_without_vat"] = round(
                     base_cost_without_vat * stage["percent"] / 100, 2
                 )
+            dated_stages = [s for s in roadmap if s.get("start_date") and s.get("end_date")]
+            if dated_stages:
+                first = dated_stages[0]
+                # Истинное начало плана — с учётом простоя перед первым этапом
+                # (если старт сдвинут в сезон, ведущее ожидание попадает в план).
+                plan_start_dt = _pdate(first["start_date"]) - timedelta(days=int(first.get("gap_days", 0)))
+                plan_start_iso = plan_start_dt.isoformat()
+                plan_end_iso = max(s["end_date"] for s in dated_stages)
+                calendar_days = max((_pdate(plan_end_iso) - plan_start_dt).days, total)
+            else:
+                plan_start_iso = None
+                plan_end_iso = None
+                calendar_days = total
+            season_wait_days = sum(int(s.get("gap_days", 0)) for s in roadmap)
             companies.append({
                 "company_id": cid,
                 "company_name": info.get("name", cid),
@@ -325,6 +448,10 @@ class ProcurementService:
                 "variants": len(comp_calcs),
                 "stage_count": len(roadmap),
                 "stages": roadmap,
+                "plan_start": plan_start_iso,
+                "plan_end": plan_end_iso,
+                "calendar_days": calendar_days,
+                "season_wait_days": season_wait_days,
                 "workdays": workdays,
                 "role_count": role_count,
                 "average_fte": average_fte,
@@ -403,11 +530,14 @@ class ProcurementService:
         matches = self.match_products(query, limit=5)
         estimate = None
         if matches and user_stages:
+            requisites = getattr(tz, "requisites", {}) or {}
+            stage_constraints = requisites.get("stage_constraints") or {}
             estimate = self.estimate_product(
                 matches[0]["product_id"],
                 additional_product_ids,
                 roadmap_stages=user_stages,
-                plan_start=(getattr(tz, "requisites", {}) or {}).get("start_date"),
+                plan_start=requisites.get("start_date"),
+                roadmap_constraints=stage_constraints if isinstance(stage_constraints, dict) else {},
             )
             if estimate:
                 estimate["roadmap_source"] = "tz"

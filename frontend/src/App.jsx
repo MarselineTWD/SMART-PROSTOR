@@ -82,6 +82,88 @@ function formatMoney(value) {
   return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(value || 0) + " ₽";
 }
 
+// Компактная сумма для подписи прямо на линии диаграммы (полная — в тултипе/списке).
+function formatMoneyShort(value) {
+  const v = Math.abs(value || 0);
+  if (v >= 1e6) return `${(value / 1e6).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} млн ₽`;
+  if (v >= 1e3) return `${Math.round(value / 1e3).toLocaleString("ru-RU")} тыс ₽`;
+  return `${Math.round(value || 0).toLocaleString("ru-RU")} ₽`;
+}
+
+// --- Диаграмма Ганта: даты, ось месяцев, сезонные ограничения ----------------
+const MONTHS_RU_SHORT = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
+
+// Цвет бара кодирует сезонное окно работ (тип ограничения), а не порядок этапа.
+// Тройка aqua/blue/orange валидирована на CVD (all-pairs). Идентичность этапа
+// несут строка и подпись; сезон дублируется иконкой + меткой (не только цветом).
+const SEASON_META = {
+  winter: { cls: "winter", label: "Зимний период (зимник)", short: "зимой" },
+  summer: { cls: "summer", label: "Летняя навигация", short: "в навигацию" },
+  "": { cls: "year", label: "Круглогодично", short: "круглый год" },
+};
+
+function parseISO(value) {
+  if (!value) return null;
+  const [y, m, d] = String(value).slice(0, 10).split("-").map(Number);
+  if (!y || !m || !d) return null;
+  return new Date(Date.UTC(y, m - 1, d));
+}
+
+function daysBetween(a, b) {
+  return Math.round((b - a) / 86400000);
+}
+
+function formatDateShort(value) {
+  const dt = parseISO(value);
+  if (!dt) return "";
+  return `${dt.getUTCDate()} ${MONTHS_RU_SHORT[dt.getUTCMonth()]} ${String(dt.getUTCFullYear()).slice(2)}`;
+}
+
+// Линейная шкала по дням: месяцы и бары ложатся на одну ось [start..end].
+function buildMonthAxis(start, end) {
+  const s = parseISO(start);
+  const e = parseISO(end);
+  if (!s || !e || e <= s) return { total: 1, months: [], start: s, end: e };
+  const total = Math.max(daysBetween(s, e), 1);
+  const months = [];
+  let cur = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), 1));
+  while (cur <= e) {
+    const next = new Date(Date.UTC(cur.getUTCFullYear(), cur.getUTCMonth() + 1, 1));
+    const from = cur < s ? s : cur;
+    const to = next > e ? e : next;
+    const isFirst = months.length === 0;
+    months.push({
+      key: `${cur.getUTCFullYear()}-${cur.getUTCMonth()}`,
+      label: MONTHS_RU_SHORT[cur.getUTCMonth()],
+      showYear: isFirst || cur.getUTCMonth() === 0,
+      year: String(cur.getUTCFullYear()).slice(2),
+      left: (daysBetween(s, from) / total) * 100,
+      width: (daysBetween(from, to) / total) * 100,
+    });
+    cur = next;
+  }
+  return { total, months, start: s, end: e };
+}
+
+function SeasonGlyph({ season }) {
+  if (season === "winter") {
+    return (
+      <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden="true">
+        <path d="M8 1v14M2 4.5l12 7M14 4.5l-12 7" />
+      </svg>
+    );
+  }
+  if (season === "summer") {
+    return (
+      <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden="true">
+        <path d="M1 6c1.6 0 1.6 1.6 3.2 1.6S5.8 6 7.4 6 9 7.6 10.6 7.6 12.2 6 13.8 6 15 7 15 7M1 11c1.6 0 1.6 1.6 3.2 1.6S5.8 11 7.4 11 9 12.6 10.6 12.6 12.2 11 13.8 11 15 12 15 12" />
+      </svg>
+    );
+  }
+  return null;
+}
+
+
 function computeLiveReady(tz, template) {
   const getValue = (key) => {
     if (["object_name", "customer_name", "executor_name"].includes(key)) return tz[key];
@@ -1206,8 +1288,8 @@ function RoadmapView({ estimate, currentTz, onEstimateTz, selectedAdditionalServ
         <div className="panel-heading">
           <div>
             <span className="eyebrow">Только по сохранённому документу</span>
-            <h3>Роадмап пользовательского ТЗ</h3>
-            <p className="muted roadmap-explanation">Этапы берутся из текущего ТЗ. Данные ПРОСТОР используются только для оценки общей длительности и стоимости подрядчиков.</p>
+            <h3>Календарный план ТЗ — диаграмма Ганта</h3>
+            <p className="muted roadmap-explanation">Этапы берутся из текущего ТЗ и раскладываются по датам и месяцам. Учитываются сезонные окна работ (полевые/сейсморазведочные — только зимой, завоз — в навигацию): старт таких этапов сдвигается на ближайший допустимый сезон. На линиях — оценочная стоимость этапа. Данные ПРОСТОР используются только для оценки длительности и стоимости подрядчиков.</p>
           </div>
           <button onClick={() => onEstimateTz([])} disabled={!currentTz}>{estimate ? "Пересчитать ТЗ" : "Рассчитать по текущему ТЗ"}</button>
         </div>
@@ -1248,6 +1330,13 @@ function RoadmapView({ estimate, currentTz, onEstimateTz, selectedAdditionalServ
                 </div>
               </details>
             )}
+            <div className="gantt-legend">
+              <span className="gantt-legend-item"><i className="gantt-swatch season-year" />Круглогодично</span>
+              <span className="gantt-legend-item"><i className="gantt-swatch season-winter" />Зимнее окно · ноя–мар</span>
+              <span className="gantt-legend-item"><i className="gantt-swatch season-summer" />Навигация · июн–окт</span>
+              <span className="gantt-legend-item"><i className="gantt-swatch gantt-swatch--wait" />Ожидание сезона</span>
+              <span className="gantt-legend-item"><i className="gantt-swatch gantt-swatch--today" />Сегодня</span>
+            </div>
             <div className="roadmap-list">
               {estimate.companies.map((company, index) => (
                 <ContractorRoadmap key={company.company_id} company={company} rank={index + 1} />
@@ -1261,6 +1350,21 @@ function RoadmapView({ estimate, currentTz, onEstimateTz, selectedAdditionalServ
 }
 
 function ContractorRoadmap({ company, rank }) {
+  const stages = company.stages || [];
+  const planStart = company.plan_start || stages[0]?.start_date;
+  const planEnd = company.plan_end
+    || stages.reduce((max, s) => (s.end_date && (!max || s.end_date > max) ? s.end_date : max), null);
+  const axis = buildMonthAxis(planStart, planEnd);
+  const hasTimeline = axis.months.length > 0;
+  const pct = (from, to) => (daysBetween(parseISO(from), parseISO(to)) / axis.total) * 100;
+
+  // Маркер «сегодня» — только если попадает в окно плана.
+  const now = new Date();
+  const todayUTC = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+  const todayPct = hasTimeline && axis.start && axis.end && todayUTC >= axis.start && todayUTC <= axis.end
+    ? (daysBetween(axis.start, todayUTC) / axis.total) * 100
+    : null;
+
   return (
     <article className="contractor-card">
       <div className="contractor-head">
@@ -1274,27 +1378,100 @@ function ContractorRoadmap({ company, rank }) {
         </div>
         <div className="contractor-est">
           <strong>{formatMoney(company.cost_without_vat)}</strong>
-          <small>без НДС · {company.estimated_days} дн · с НДС {formatMoney(company.cost_with_vat)}</small>
+          <small>без НДС · {company.estimated_days} раб. дн · с НДС {formatMoney(company.cost_with_vat)}</small>
           {company.additional_cost_without_vat > 0 && <small>допработы: +{formatMoney(company.additional_cost_without_vat)}</small>}
         </div>
       </div>
 
-      <div className="roadmap-track">
-        {company.stages.map((stage, i) => (
-          <div key={stage.order} className={`roadmap-seg c${i % 5}`} style={{ width: `${stage.percent}%` }}
-            title={`${stage.name} — ${stage.days} дн${stage.start_date ? ` (${stage.start_date}…${stage.end_date})` : ""}`}>
-            <span>{stage.days}</span>
+      {hasTimeline ? (
+        <div className="gantt">
+          <div className="gantt-row gantt-head-row">
+            <div className="gantt-label gantt-label--head">Этап работ</div>
+            <div className="gantt-timeline">
+              {axis.months.map((m) => (
+                <div key={m.key} className="gantt-month" style={{ left: `${m.left}%`, width: `${m.width}%` }}>
+                  <span>{m.label}{m.showYear ? ` ’${m.year}` : ""}</span>
+                </div>
+              ))}
+              {todayPct !== null && (
+                <div className="gantt-today" style={{ left: `${todayPct}%` }}><span>сегодня</span></div>
+              )}
+            </div>
           </div>
-        ))}
-      </div>
+
+          {stages.map((stage) => {
+            const meta = SEASON_META[stage.constraint_season] || SEASON_META[""];
+            const left = pct(planStart, stage.start_date);
+            const width = Math.max(pct(stage.start_date, stage.end_date), 1.5);
+            const gapWidth = stage.gap_days > 0 ? (stage.gap_days / axis.total) * 100 : 0;
+            const tooltip =
+              `${stage.name}\n${formatDateShort(stage.start_date)} → ${formatDateShort(stage.end_date)} · ${stage.days} дн`
+              + `\nОценка этапа: ${formatMoney(stage.estimated_cost_without_vat)} без НДС`
+              + (stage.constraint_label ? `\n${meta.label}. ${stage.constraint_reason}` : "")
+              + (stage.gap_days > 0 ? `\nОжидание сезона перед стартом: ${stage.gap_days} дн` : "");
+            return (
+              <div key={stage.order} className="gantt-row">
+                <div className="gantt-label">
+                  <span className="gantt-stage-name">{stage.order}. {stage.name}</span>
+                  {stage.constraint_season && (
+                    <span className={`gantt-season-tag season-${meta.cls}`} title={stage.constraint_reason}>
+                      <SeasonGlyph season={stage.constraint_season} />{meta.short}
+                    </span>
+                  )}
+                </div>
+                <div className="gantt-track">
+                  {axis.months.slice(1).map((m) => (
+                    <span key={m.key} className="gantt-gridline" style={{ left: `${m.left}%` }} />
+                  ))}
+                  {todayPct !== null && <span className="gantt-today-line" style={{ left: `${todayPct}%` }} />}
+                  {gapWidth > 0 && (
+                    <div className="gantt-wait" style={{ left: `${left - gapWidth}%`, width: `${gapWidth}%` }}
+                      title={`Ожидание сезона: ${stage.gap_days} дн`} />
+                  )}
+                  <div className={`gantt-bar season-${meta.cls}`} style={{ left: `${left}%`, width: `${width}%` }} title={tooltip}>
+                    <span className="gantt-bar-label">{formatMoneyShort(stage.estimated_cost_without_vat)}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+
+          <p className="gantt-axis-note">
+            План: {formatDateShort(planStart)} — {formatDateShort(planEnd)} · {company.calendar_days} дн по календарю
+            {company.season_wait_days > 0 ? `, из них ожидание сезона ${company.season_wait_days} дн` : ""}
+          </p>
+        </div>
+      ) : (
+        <div className="roadmap-track">
+          {stages.map((stage, i) => (
+            <div key={stage.order} className={`roadmap-seg c${i % 5}`} style={{ width: `${stage.percent}%` }}
+              title={`${stage.name} — ${stage.days} дн`}>
+              <span>{stage.days}</span>
+            </div>
+          ))}
+        </div>
+      )}
 
       <ol className="roadmap-stages">
-        {company.stages.map((stage) => (
-          <li key={stage.order}>
-            <span className="rs-name">{stage.name}</span>
-            <span className="rs-days">{stage.days} дн · {formatMoney(stage.estimated_cost_without_vat)}</span>
-          </li>
-        ))}
+        {stages.map((stage) => {
+          const meta = SEASON_META[stage.constraint_season] || SEASON_META[""];
+          return (
+            <li key={stage.order}>
+              <span className="rs-name">
+                {stage.name}
+                {stage.start_date && (
+                  <em className="rs-dates"> · {formatDateShort(stage.start_date)}–{formatDateShort(stage.end_date)}</em>
+                )}
+                {stage.constraint_season && (
+                  <span className={`rs-season season-${meta.cls}`} title={stage.constraint_reason}>
+                    <SeasonGlyph season={stage.constraint_season} />{meta.label}
+                  </span>
+                )}
+              </span>
+              <span className="rs-days">{stage.days} дн · {formatMoney(stage.estimated_cost_without_vat)}</span>
+            </li>
+          );
+        })}
       </ol>
       {company.additional_services?.length > 0 && (
         <div className="contractor-addons">
