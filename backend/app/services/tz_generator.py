@@ -7,9 +7,6 @@ OpenAI-совместимый endpoint, а при любой ошибке — о
 """
 from __future__ import annotations
 
-import json
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -22,6 +19,7 @@ from backend.app.models.domain import (
     TZTemplate,
 )
 from backend.app.services.tz_templates import tz_template_service
+from backend.app.services.llm import llm_complete
 
 
 ABBREVIATIONS = [
@@ -157,6 +155,12 @@ class TZGenerator:
     def _context(self, document: TZDocument, template: TZTemplate) -> dict:
         data = document.input_data
         stages = document.requisites.get("stages") or template.stage_presets
+        domain_parameters = [
+            f"{field.label}: {document.requisites[field.key]}"
+            for field in template.fields
+            if field.key in document.requisites
+            and document.requisites[field.key] not in (None, "", False)
+        ]
         return {
             "object": document.object_name or "объект работ",
             "customer": document.customer_name or "Заказчик",
@@ -165,6 +169,7 @@ class TZGenerator:
             "deadline": (data.deadline or "").strip() or "[указать дату]",
             "city": str(document.requisites.get("city") or "").strip() or "по месту нахождения Исполнителя",
             "stages": list(stages),
+            "domain_parameters": domain_parameters,
             "source_data_ready": bool(data.source_data_ready),
             "needs_3d": bool(data.needs_3d_model),
             "requires_subcontractor": bool(data.requires_subcontractor),
@@ -200,10 +205,13 @@ class TZGenerator:
         return "В настоящем ТЗ приняты следующие сокращения:\n" + "\n".join(ABBREVIATIONS)
 
     def _sec_scope(self, ctx: dict) -> str:
-        return (
+        text = (
             f"Периметр работ: {ctx['object']}. Заказчик: {ctx['customer']}.\n"
             f"Место выполнения работ: {ctx['city']}."
         )
+        if ctx["domain_parameters"]:
+            text += "\nПараметры выбранного типа ТЗ:\n- " + "\n- ".join(ctx["domain_parameters"])
+        return text
 
     def _sec_schedule(self, ctx: dict) -> str:
         return (
@@ -309,6 +317,7 @@ class TZGenerator:
             f"Раздел ТЗ: {key}.\n"
             f"Объект: {ctx['object']}. Заказчик: {ctx['customer']}. Исполнитель: {ctx['executor']}.\n"
             f"Цель: {ctx['goal']}. Срок: {ctx['deadline']}. Этапы: {', '.join(ctx['stages'])}.\n"
+            f"Параметры выбранного типа ТЗ: {', '.join(ctx['domain_parameters']) or 'не указаны'}.\n"
             f"Черновик раздела: {draft_text}\n"
         )
         if instruction:
@@ -316,30 +325,7 @@ class TZGenerator:
         return self._llm_complete(system, prompt)
 
     def _llm_complete(self, system: str, prompt: str) -> str | None:
-        try:
-            payload = {
-                "model": settings.llm_model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.3,
-            }
-            req = urllib.request.Request(
-                f"{settings.llm_base_url.rstrip('/')}/chat/completions",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {settings.llm_api_key}",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=settings.llm_timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            content = data["choices"][0]["message"]["content"]
-            return content.strip() or None
-        except (urllib.error.URLError, KeyError, ValueError, TimeoutError, OSError):
-            return None
+        return llm_complete(system, prompt, temperature=0.3)
 
 
 tz_generator = TZGenerator()

@@ -1,4 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Bot, CalendarDays, CircleUserRound, Clock3, FileText,
+  History, LayoutDashboard, Search, Sparkles,
+} from "./icons";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
 const AI_CHAT_ENDPOINT = import.meta.env.VITE_AI_CHAT_ENDPOINT ?? `${API_BASE}/assistant/chat`;
@@ -47,8 +51,125 @@ function buildInputPayload(input) {
   return { ...input, subcontract_share_percent: numOrNull(input.subcontract_share_percent) };
 }
 
+function formatMoney(value) {
+  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(value || 0) + " ₽";
+}
+
+function computeLiveReady(tz, template) {
+  const getValue = (key) => {
+    if (["object_name", "customer_name", "executor_name"].includes(key)) return tz[key];
+    if (key === "contract_number") return tz.contract_name;
+    return tz.requisites?.[key];
+  };
+  const templateRequired = (template?.fields || []).filter((field) => field.required);
+  const requiredValues = [tz.object_name, tz.customer_name, tz.input_data?.goal, tz.input_data?.deadline,
+    ...templateRequired.filter((field) => !["object_name", "customer_name"].includes(field.key)).map((field) => getValue(field.key))];
+  const filledFields = requiredValues.filter((value) => value !== null && value !== undefined && String(value).trim() !== "").length;
+  const fieldRatio = requiredValues.length ? filledFields / requiredValues.length : 0;
+  const sectionRatio = tz.sections?.length ? tz.sections.filter((section) => section.content.trim()).length / tz.sections.length : 0;
+  const stageRatio = tz.requisites?.stages?.length ? 1 : 0;
+  return Math.max(0, Math.min(100, Math.round((fieldRatio * .4 + sectionRatio * .45 + stageRatio * .15) * 100)));
+}
+
+function TemplateFields({ fields, values, onChange }) {
+  const groups = fields.reduce((result, field) => {
+    const group = field.group || "Основные данные";
+    result[group] = [...(result[group] || []), field];
+    return result;
+  }, {});
+
+  const renderField = (field) => {
+    const value = values[field.key] ?? (field.input_type === "checkbox" ? false : "");
+    if (field.input_type === "checkbox") {
+      return <Toggle key={field.key} label={field.label} checked={Boolean(value)} onChange={(next) => onChange(field.key, next)} />;
+    }
+    if (field.input_type === "select") {
+      return (
+        <label key={field.key}>
+          <span>{field.label}{field.required && <b> *</b>}</span>
+          <select value={value} onChange={(event) => onChange(field.key, event.target.value)}>
+            <option value="">— выберите —</option>
+            {field.options.map((option) => <option key={option} value={option}>{option}</option>)}
+          </select>
+        </label>
+      );
+    }
+    if (field.input_type === "textarea") {
+      return (
+        <label key={field.key} className="span-2">
+          <span>{field.label}{field.required && <b> *</b>}</span>
+          <textarea rows={3} value={value} placeholder={field.placeholder}
+            onChange={(event) => onChange(field.key, event.target.value)} />
+        </label>
+      );
+    }
+    return <TextInput key={field.key} label={`${field.label}${field.required ? " *" : ""}`}
+      type={field.input_type || "text"} value={value} placeholder={field.placeholder}
+      onChange={(next) => onChange(field.key, next)} />;
+  };
+
+  return Object.entries(groups).map(([group, groupFields]) => (
+    <details className="template-field-group span-2" key={group} open={groupFields.some((field) => field.required)}>
+      <summary>
+        <span>{group}</span>
+        <small>{groupFields.filter((field) => field.required).length
+          ? `обязательных: ${groupFields.filter((field) => field.required).length}`
+          : `${groupFields.length} полей`}</small>
+      </summary>
+      <div className="form-grid">{groupFields.map(renderField)}</div>
+    </details>
+  ));
+}
+
+function ExampleDialog({ template, onClose }) {
+  const example = template?.example || {};
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="example-dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <header>
+          <div><span className="eyebrow">Справка по шаблону</span><h3>{template?.name}</h3></div>
+          <button className="icon-button" onClick={onClose} aria-label="Закрыть">×</button>
+        </header>
+        <p>{template?.description}</p>
+        <dl>
+          <div><dt>Пример объекта</dt><dd>{example.object_name}</dd></div>
+          <div><dt>Заказчик</dt><dd>{example.customer_name}</dd></div>
+          <div><dt>Цель</dt><dd>{example.goal}</dd></div>
+          <div><dt>Срок</dt><dd>{example.deadline}</dd></div>
+        </dl>
+        <h4>Пример структуры работ</h4>
+        <ol>{(example.stages || []).map((stage) => <li key={stage}>{stage}</li>)}</ol>
+        <div className="example-result"><strong>Ожидаемый результат</strong><p>{example.result}</p></div>
+        <button onClick={onClose}>Понятно</button>
+      </section>
+    </div>
+  );
+}
+
+function OilGauge({ value, className }) {
+  return (
+    <div className={`oil-gauge ${className || ""} ${value >= 100 ? "is-full" : ""}`} aria-label={`Заполненность ТЗ ${value}%`}>
+      <div className="oil-gauge-spill" aria-hidden="true"><i /><i /><i /></div>
+      <div className="oil-gauge-tube">
+        <div className="oil-gauge-fluid" style={{ "--oil-level": `${value}%` }}>
+          <span className="oil-wave" /><i className="bubble b1" /><i className="bubble b2" /><i className="bubble b3" />
+        </div>
+        <div className="oil-gauge-marks">{[100, 75, 50, 25].map((mark) => <span key={mark}>{mark}</span>)}</div>
+      </div>
+      <strong>{value}%</strong>
+      <span>Заполненность ТЗ</span>
+      <small>{value === 100 ? "Готово к выпуску" : "Заполняйте поля и разделы"}</small>
+    </div>
+  );
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState("search");
+  const urlParams = new URLSearchParams(window.location.search);
+  const requestedTab = urlParams.get("tab");
+  const requestedTzId = urlParams.get("tz");
+  const [activeTab, setActiveTab] = useState(
+    ["search", "constructor", "mytz", "roadmap", "analytics"].includes(requestedTab) ? requestedTab : "search",
+  );
   const [status, setStatus] = useState("Готов к демонстрации");
   const [isLoading, setIsLoading] = useState(false);
 
@@ -59,8 +180,10 @@ export default function App() {
 
   // ТЗ
   const [templates, setTemplates] = useState([]);
+  const [templateDetails, setTemplateDetails] = useState({});
   const [tzList, setTzList] = useState([]);
   const [currentTz, setCurrentTz] = useState(null);
+  const [validation, setValidation] = useState(null);
   const [newTz, setNewTz] = useState(emptyNewTz);
   const [tzInstruction, setTzInstruction] = useState("");
   const [tzBusy, setTzBusy] = useState(false);
@@ -69,10 +192,12 @@ export default function App() {
   const [estProducts, setEstProducts] = useState([]);
   const [estProductId, setEstProductId] = useState("");
   const [estimate, setEstimate] = useState(null);
+  const [selectedAdditionalServices, setSelectedAdditionalServices] = useState([]);
 
   // Аналитика и ассистент
   const [analytics, setAnalytics] = useState(null);
-  const [isChatOpen, setIsChatOpen] = useState(true);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [assistantStatus, setAssistantStatus] = useState(null);
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState([{ id: "assistant-start", role: "assistant", text: "Готов помочь с ТЗ." }]);
   const [isAssistantLoading, setIsAssistantLoading] = useState(false);
@@ -87,6 +212,8 @@ export default function App() {
     loadTemplates();
     loadTzList();
     loadEstProducts();
+    loadAssistantStatus();
+    if (requestedTzId) openTz(requestedTzId);
   }, []);
 
   async function request(path, options = {}) {
@@ -145,9 +272,21 @@ export default function App() {
     try {
       const data = await request("/tz/templates");
       setTemplates(data.templates);
+      const details = await Promise.all(
+        data.templates.map((template) => request(`/tz/templates/${template.key}`).catch(() => null)),
+      );
+      setTemplateDetails(Object.fromEntries(details.filter(Boolean).map((item) => [item.template.key, item.template])));
       setNewTz((current) => ({ ...current, template_key: current.template_key || data.templates[0]?.key || "" }));
     } catch (error) {
       setStatus(`Не удалось загрузить шаблоны: ${error.message}`);
+    }
+  }
+
+  async function loadAssistantStatus() {
+    try {
+      setAssistantStatus(await request("/assistant/status"));
+    } catch {
+      setAssistantStatus({ enabled: false, provider: "rules", model: "offline" });
     }
   }
 
@@ -161,13 +300,20 @@ export default function App() {
   }
 
   function buildCreatePayload(source, templateKey, autoFill) {
+    const template = templateDetails[templateKey];
+    const requisites = {};
+    for (const field of template?.fields || []) {
+      if (["object_name", "customer_name", "executor_name"].includes(field.key)) continue;
+      if (field.key === "contract_number") continue;
+      if (source[field.key] !== undefined && source[field.key] !== "") requisites[field.key] = source[field.key];
+    }
     return {
       template_key: templateKey,
       object_name: source.object_name || null,
       customer_name: source.customer_name || null,
       executor_name: source.executor_name || null,
-      contract_name: source.contract_name || null,
-      requisites: source.city ? { city: source.city } : {},
+      contract_name: source.contract_number || source.contract_name || null,
+      requisites,
       input_data: buildInputPayload({
         ...emptyInput,
         object_name: source.object_name || "",
@@ -189,6 +335,7 @@ export default function App() {
         body: JSON.stringify(buildCreatePayload(newTz, newTz.template_key, newTz.auto_fill)),
       });
       setCurrentTz(data.document);
+      setValidation(data.validation);
       setActiveTab("constructor");
       setStatus(newTz.auto_fill ? "ТЗ создано и заполнено ИИ" : "ТЗ создано");
       loadTzList();
@@ -208,6 +355,7 @@ export default function App() {
       const source = { object_name: "", customer_name: emptyInput.customer_name, goal: result.product.summary, deadline: emptyInput.deadline };
       const data = await request("/tz", { method: "POST", body: JSON.stringify(buildCreatePayload(source, templateKey, true)) });
       setCurrentTz(data.document);
+      setValidation(data.validation);
       setActiveTab("constructor");
       setStatus("ТЗ сформировано ИИ, проверьте разделы");
       loadTzList();
@@ -222,6 +370,7 @@ export default function App() {
     try {
       const data = await request(`/tz/${id}`);
       setCurrentTz(data.document);
+      setValidation(data.validation);
       setActiveTab("constructor");
     } catch (error) {
       setStatus(`Не удалось открыть ТЗ: ${error.message}`);
@@ -243,6 +392,7 @@ export default function App() {
     };
     const data = await request(`/tz/${currentTz.id}`, { method: "PUT", body: JSON.stringify(payload) });
     setCurrentTz(data.document);
+    setValidation(data.validation);
     if (!silent) {
       setStatus("ТЗ сохранено");
       loadTzList();
@@ -261,6 +411,7 @@ export default function App() {
         body: JSON.stringify({ mode, instruction: instruction || null, section_keys: sectionKeys }),
       });
       setCurrentTz(data.document);
+      setValidation(data.validation);
       setStatus(`Готовность ТЗ: ${data.document.ready_score}%`);
       loadTzList();
     } catch (error) {
@@ -276,23 +427,33 @@ export default function App() {
     setTzBusy(true);
     setStatus("Меняю шаблон ТЗ");
     try {
-      const oldId = currentTz.id;
-      const source = {
-        object_name: currentTz.object_name,
-        customer_name: currentTz.customer_name,
-        executor_name: currentTz.executor_name,
-        contract_name: currentTz.contract_name,
-        city: currentTz.requisites?.city || "",
-        goal: currentTz.input_data?.goal || "",
-        deadline: currentTz.input_data?.deadline || "",
-      };
-      const data = await request("/tz", { method: "POST", body: JSON.stringify(buildCreatePayload(source, templateKey, false)) });
-      await request(`/tz/${oldId}`, { method: "DELETE" }).catch(() => {});
+      const data = await request(`/tz/${currentTz.id}/switch-template`, {
+        method: "POST",
+        body: JSON.stringify({ template_key: templateKey }),
+      });
       setCurrentTz(data.document);
+      setValidation(data.validation);
       setStatus("Шаблон изменён");
       loadTzList();
     } catch (error) {
       setStatus(`Ошибка смены шаблона: ${error.message}`);
+    } finally {
+      setTzBusy(false);
+    }
+  }
+
+  async function validateCurrentTz() {
+    if (!currentTz) return;
+    setTzBusy(true);
+    setStatus("Проверяю ТЗ по обязательным полям и бизнес-правилам");
+    try {
+      const saved = await saveTz(true);
+      const result = await request(`/tz/${saved.id}/validate`, { method: "POST" });
+      setValidation(result);
+      setCurrentTz((current) => ({ ...current, ready_score: result.ready_score }));
+      setStatus(result.valid ? "ТЗ прошло проверку" : `Найдено замечаний: ${result.issues.length}`);
+    } catch (error) {
+      setStatus(`Ошибка проверки ТЗ: ${error.message}`);
     } finally {
       setTzBusy(false);
     }
@@ -345,17 +506,26 @@ export default function App() {
     }
   }
 
-  async function loadEstimate(productId) {
+  async function loadEstimate(productId, additionalIds = []) {
     if (!productId) return;
     setEstProductId(productId);
-    setStatus("Считаю сроки по подрядчикам");
+    setSelectedAdditionalServices(additionalIds);
+    setStatus("Считаю сроки и стоимость по подрядчикам");
     try {
-      const data = await request(`/estimates/products/${productId}`);
+      const query = additionalIds.map((id) => `additional_product_ids=${encodeURIComponent(id)}`).join("&");
+      const data = await request(`/estimates/products/${productId}${query ? `?${query}` : ""}`);
       setEstimate(data);
       setStatus(`Оценка готова: ${data.summary.company_count} подрядчиков`);
     } catch (error) {
       setStatus(`Ошибка оценки: ${error.message}`);
     }
+  }
+
+  function toggleAdditionalService(productId) {
+    const next = selectedAdditionalServices.includes(productId)
+      ? selectedAdditionalServices.filter((id) => id !== productId)
+      : [...selectedAdditionalServices, productId];
+    loadEstimate(estProductId, next);
   }
 
   async function estimateForCurrentTz() {
@@ -367,6 +537,7 @@ export default function App() {
       if (data.estimate) {
         setEstimate(data.estimate);
         setEstProductId(data.estimate.product_id);
+        setSelectedAdditionalServices([]);
         setStatus(`Подобран продукт: ${data.matched?.name ?? "—"}`);
       } else {
         setStatus("Не удалось подобрать продукт по ТЗ — выберите вручную");
@@ -384,6 +555,8 @@ export default function App() {
         ? { id: currentTz.id, template_name: currentTz.template_name, ready_score: currentTz.ready_score,
             sections_filled: currentTz.sections.filter((s) => s.content.trim()).length, sections_total: currentTz.sections.length }
         : null,
+      validation_issues: validation?.issues || [],
+      estimate_summary: estimate?.summary || null,
     };
   }
 
@@ -432,17 +605,50 @@ export default function App() {
     roadmap: "Сроки и роадмап подрядчиков",
     analytics: "Контур управления",
   };
+  const tabIcons = {
+    search: Search,
+    constructor: FileText,
+    mytz: History,
+    roadmap: Clock3,
+    analytics: LayoutDashboard,
+  };
 
   return (
-    <main className={`app-shell ${isChatOpen ? "chat-open" : "chat-closed"}`}>
+    <div className="platform-shell">
+      <header className="platform-header">
+        <button className="platform-brand" type="button" onClick={() => setActiveTab("search")}>
+          <span className="platform-brand-mark"><span>П</span></span>
+          <span><strong>ПРОСТОР</strong><small>единое окно заказчика</small></span>
+        </button>
+        <nav className="platform-nav" aria-label="Основная навигация">
+          {tabs.map(([key, label]) => {
+            const Icon = tabIcons[key];
+            return (
+              <button key={key} className={activeTab === key ? "active" : ""} onClick={() => setActiveTab(key)}>
+                <Icon size={17} />{label}
+              </button>
+            );
+          })}
+        </nav>
+        <div className="platform-user">
+          <button className="platform-ai" type="button" onClick={() => setIsChatOpen((current) => !current)}>
+            <Sparkles size={17} /> AI-помощник
+          </button>
+          <span className="platform-avatar"><CircleUserRound size={19} /></span>
+          <span><strong>Заказчик</strong><small>рабочее пространство</small></span>
+        </div>
+      </header>
+
+      <main className={`app-shell ${isChatOpen ? "chat-open" : "chat-closed"}`}>
       <aside className="sidebar">
-        <section className="brand">
-          <span className="eyebrow">PROSTOR MVP</span>
-          <h1>Умный конструктор ТЗ</h1>
+        <section className="side-welcome">
+          <span className="side-welcome-icon"><Bot size={22} /></span>
+          <span className="eyebrow">Умный рабочий стол</span>
+          <h1>Конструктор ТЗ</h1>
           <p>Поиск продукта, сборка ТЗ из шаблонов, ИИ-заполнение и оценка сроков подрядчиков.</p>
         </section>
 
-        <nav className="tabs" aria-label="Разделы">
+        <nav className="tabs side-tabs" aria-label="Разделы">
           {tabs.map(([key, label]) => (
             <button key={key} className={activeTab === key ? "active" : ""} onClick={() => setActiveTab(key)}>
               {label}
@@ -465,10 +671,13 @@ export default function App() {
       <section className="workspace">
         <header className="topbar">
           <div>
-            <span className="eyebrow">Единый демо-поток</span>
+            <span className="eyebrow">ПРОСТОР · единый рабочий процесс</span>
             <h2>{titles[activeTab]}</h2>
           </div>
-          <span className={`status ${isLoading || tzBusy ? "loading" : ""}`}>{status}</span>
+          <div className="topbar-meta">
+            <span><CalendarDays size={16} /> {new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "long" }).format(new Date())}</span>
+            <span className={`status ${isLoading || tzBusy ? "loading" : ""}`}>{status}</span>
+          </div>
         </header>
 
         {activeTab === "search" && (
@@ -488,7 +697,9 @@ export default function App() {
         {activeTab === "constructor" && (
           <ConstructorView
             templates={templates}
+            templateDetails={templateDetails}
             currentTz={currentTz}
+            validation={validation}
             newTz={newTz}
             setNewTz={setNewTz}
             createTz={createTz}
@@ -500,6 +711,7 @@ export default function App() {
             onSave={saveTz}
             onExport={exportTz}
             onEstimate={estimateForCurrentTz}
+            onValidate={validateCurrentTz}
             onNew={() => setCurrentTz(null)}
             updateTzField={updateTzField}
             updateTzInput={updateTzInput}
@@ -515,7 +727,8 @@ export default function App() {
 
         {activeTab === "roadmap" && (
           <RoadmapView products={estProducts} productId={estProductId} estimate={estimate}
-            onSelect={loadEstimate} hasTz={Boolean(currentTz)} onEstimateTz={estimateForCurrentTz} />
+            onSelect={(id) => loadEstimate(id, [])} hasTz={Boolean(currentTz)} onEstimateTz={estimateForCurrentTz}
+            selectedAdditionalServices={selectedAdditionalServices} onToggleAdditional={toggleAdditionalService} />
         )}
 
         {activeTab === "analytics" && <AnalyticsView analytics={analytics} />}
@@ -532,8 +745,14 @@ export default function App() {
         hasTz={Boolean(currentTz)}
         onAugment={() => generateTz("augment")}
         onFull={() => generateTz("full")}
+        status={assistantStatus}
       />
-    </main>
+      </main>
+      <footer className="platform-footer">
+        <span>ПРОСТОР · Корпоративная цифровая платформа</span>
+        <span>Backend и данные подключены · DeepSeek API</span>
+      </footer>
+    </div>
   );
 }
 
@@ -541,20 +760,25 @@ function SearchView({ query, setQuery, runSearch, response, results, selectedRes
   return (
     <div className="grid two-columns">
       <section className="panel search-panel">
-        <form className="search-box" onSubmit={(e) => { e.preventDefault(); runSearch(); }}>
+        <form className="search-box search-hero" onSubmit={(e) => { e.preventDefault(); runSearch(); }}>
+          <div className="search-intro">
+            <span className="eyebrow">Шаг 1</span>
+            <h3>Опишите задачу своими словами</h3>
+            <p>Система найдёт подходящий продукт, договоры, исполнителей и шаблон ТЗ.</p>
+          </div>
           <label>
-            <span>Запрос пользователя</span>
+            <span>Что нужно выполнить?</span>
             <textarea value={query} onChange={(e) => setQuery(e.target.value)} rows={4} />
           </label>
           <div className="actions">
-            <button type="submit">Найти решение</button>
-            <button type="button" className="secondary" onClick={() => runSearch(demoQuery)}>Демо-запрос</button>
+            <button type="submit">Подобрать услугу</button>
+            <button type="button" className="secondary" onClick={() => { setQuery(demoQuery); runSearch(demoQuery); }}>Подставить пример</button>
           </div>
         </form>
 
         {response && (
           <div className="intent-line">
-            <span>Интент</span>
+            <span><b>Понял задачу как:</b><small> категория запроса для подбора сценария</small></span>
             <strong>{intentLabels[response.detected_intent]}</strong>
           </div>
         )}
@@ -564,9 +788,12 @@ function SearchView({ query, setQuery, runSearch, response, results, selectedRes
             <button key={result.product.id}
               className={`result-card ${selectedResult?.product.id === result.product.id ? "selected" : ""}`}
               onClick={() => setSelectedResult(result)}>
-              <span className="score">{result.score}</span>
-              <strong>{result.product.name}</strong>
-              <small>{result.product.summary}</small>
+              <span className="score">{Math.min(100, Math.round(result.score / 20 * 100))}%<small>совпадение</small></span>
+              <span className="result-copy">
+                <strong>{result.product.name}</strong>
+                <small>{result.product.summary}</small>
+                <em>{result.reasons?.slice(0, 2).join(" ")}</em>
+              </span>
             </button>
           ))}
         </div>
@@ -618,8 +845,9 @@ function ConstructorView(props) {
   return <TzEditor {...props} />;
 }
 
-function NewTzForm({ templates, newTz, setNewTz, createTz, tzBusy }) {
-  const selected = templates.find((t) => t.key === newTz.template_key);
+function NewTzForm({ templates, templateDetails, newTz, setNewTz, createTz, tzBusy }) {
+  const selected = templateDetails[newTz.template_key] || templates.find((t) => t.key === newTz.template_key);
+  const [showExample, setShowExample] = useState(false);
   const set = (key, value) => setNewTz((current) => ({ ...current, [key]: value }));
   return (
     <div className="grid two-columns">
@@ -632,18 +860,16 @@ function NewTzForm({ templates, newTz, setNewTz, createTz, tzBusy }) {
           <button onClick={createTz} disabled={!newTz.template_key || tzBusy}>Создать ТЗ</button>
         </div>
 
-        <label>
-          <span>Тип / шаблон ТЗ</span>
-          <select value={newTz.template_key} onChange={(e) => set("template_key", e.target.value)}>
-            {templates.map((t) => <option key={t.key} value={t.key}>{t.name}</option>)}
+        <label className="template-select">
+          <span>Тип технического задания</span>
+          <select value={newTz.template_key} onChange={(event) => set("template_key", event.target.value)}>
+            {templates.map((template) => <option key={template.key} value={template.key}>{template.name}</option>)}
           </select>
+          <small>{selected?.description}</small>
         </label>
 
         <div className="form-grid">
-          <TextInput label="Объект / месторождение" value={newTz.object_name} onChange={(v) => set("object_name", v)} />
-          <TextInput label="Заказчик" value={newTz.customer_name} onChange={(v) => set("customer_name", v)} />
-          <TextInput label="Исполнитель" value={newTz.executor_name} onChange={(v) => set("executor_name", v)} />
-          <TextInput label="Место выполнения" value={newTz.city} onChange={(v) => set("city", v)} />
+          <TemplateFields fields={selected?.fields || []} values={newTz} onChange={set} />
           <label className="span-2">
             <span>Цель работ</span>
             <textarea value={newTz.goal} onChange={(e) => set("goal", e.target.value)} rows={3} />
@@ -653,22 +879,23 @@ function NewTzForm({ templates, newTz, setNewTz, createTz, tzBusy }) {
 
         <div className="toggle-grid">
           <Toggle label="Сразу заполнить черновик с ИИ" checked={newTz.auto_fill} onChange={(v) => set("auto_fill", v)} />
+          <button type="button" className="example-button" onClick={() => setShowExample(true)}>? Пример готового ТЗ</button>
         </div>
+        {showExample && <ExampleDialog template={selected} onClose={() => setShowExample(false)} />}
       </section>
 
       <section className="panel">
         <InfoGroup title="Описание шаблона">
           <p className="muted">{selected?.description || "Выберите шаблон, чтобы увидеть описание."}</p>
         </InfoGroup>
-        <InfoGroup title="Разделов в шаблоне">
-          <div className="chips"><span>{selected?.section_count ?? 0} разделов</span></div>
+        <InfoGroup title="Исходный файл">
+          <div className="chips">{(selected?.source_files || []).map((file) => <span key={file}>{file}</span>)}</div>
         </InfoGroup>
-        <InfoGroup title="Все доступные шаблоны">
-          <div className="chips">
-            {templates.map((t) => (
-              <span key={t.key} style={{ cursor: "pointer" }} onClick={() => set("template_key", t.key)}>{t.name}</span>
-            ))}
-          </div>
+        <InfoGroup title="Этапы из шаблона">
+          <ol className="compact-list">{(selected?.stage_presets || []).map((stage) => <li key={stage}>{stage}</li>)}</ol>
+        </InfoGroup>
+        <InfoGroup title={`Структура (${selected?.sections?.length ?? selected?.section_count ?? 0})`}>
+          <ol className="compact-list">{(selected?.sections || []).map((section) => <li key={section.key}>{section.title}</li>)}</ol>
         </InfoGroup>
       </section>
     </div>
@@ -676,10 +903,26 @@ function NewTzForm({ templates, newTz, setNewTz, createTz, tzBusy }) {
 }
 
 function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstruction, onSwitchTemplate,
-  onGenerate, onSave, onExport, onEstimate, onNew, updateTzField, updateTzInput, updateTzReq, updateSection }) {
+  onGenerate, onSave, onExport, onEstimate, onValidate, onNew, updateTzField, updateTzInput, updateTzReq, updateSection,
+  validation, templateDetails }) {
   const tz = currentTz;
-  const readyClass = tz.ready_score >= 70 ? "good" : tz.ready_score >= 40 ? "warn" : "bad";
+  const template = templateDetails[tz.template_key];
+  const [showExample, setShowExample] = useState(false);
   const input = tz.input_data || {};
+  const liveReady = computeLiveReady(tz, template);
+  const readyClass = liveReady >= 70 ? "good" : liveReady >= 40 ? "warn" : "bad";
+  const templateValues = {
+    ...tz.requisites,
+    object_name: tz.object_name || "",
+    customer_name: tz.customer_name || "",
+    executor_name: tz.executor_name || "",
+    contract_number: tz.contract_name || "",
+  };
+  const setTemplateValue = (key, value) => {
+    if (["object_name", "customer_name", "executor_name"].includes(key)) updateTzField(key, value);
+    else if (key === "contract_number") updateTzField("contract_name", value);
+    else updateTzReq(key, value);
+  };
   return (
     <div className="grid draft-grid">
       <section className="panel">
@@ -689,12 +932,19 @@ function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstructio
             <h3>{tz.template_name}</h3>
           </div>
           <div className="actions">
-            <button onClick={() => onGenerate("augment")} disabled={tzBusy}>Дополнить с ИИ</button>
-            <button onClick={() => onGenerate("full")} disabled={tzBusy}>Сгенерировать полностью</button>
-            <button className="secondary" onClick={() => onSave()} disabled={tzBusy}>Сохранить</button>
-            <button className="secondary" onClick={() => onExport(tz.id, tz.title)}>Экспорт DOCX</button>
-            <button className="secondary" onClick={onEstimate}>Оценить сроки</button>
-            <button className="secondary" onClick={onNew}>Новое</button>
+            <button onClick={() => onSave()} disabled={tzBusy}>Сохранить</button>
+            <button className="secondary" onClick={onValidate} disabled={tzBusy}>Проверить</button>
+            <button className="example-button" onClick={() => setShowExample(true)}>? Пример</button>
+            <details className="action-menu">
+              <summary>Действия</summary>
+              <div>
+                <button onClick={() => onGenerate("augment")} disabled={tzBusy}>Дополнить с DeepSeek</button>
+                <button onClick={() => onGenerate("full")} disabled={tzBusy}>Пересобрать полностью</button>
+                <button onClick={() => onExport(tz.id, tz.title)}>Экспорт DOCX</button>
+                <button onClick={onEstimate}>Сроки и стоимость</button>
+                <button onClick={onNew}>Новое ТЗ</button>
+              </div>
+            </details>
           </div>
         </div>
 
@@ -707,16 +957,14 @@ function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstructio
 
         <div className="form-grid">
           <TextInput label="Название ТЗ" value={tz.title || ""} onChange={(v) => updateTzField("title", v)} />
-          <TextInput label="Объект" value={tz.object_name || ""} onChange={(v) => updateTzField("object_name", v)} />
-          <TextInput label="Заказчик" value={tz.customer_name || ""} onChange={(v) => updateTzField("customer_name", v)} />
-          <TextInput label="Исполнитель" value={tz.executor_name || ""} onChange={(v) => updateTzField("executor_name", v)} />
-          <TextInput label="Место выполнения" value={tz.requisites?.city || ""} onChange={(v) => updateTzReq("city", v)} />
+          <TemplateFields fields={template?.fields || []} values={templateValues} onChange={setTemplateValue} />
           <TextInput label="Плановый срок" type="date" value={input.deadline || ""} onChange={(v) => updateTzInput("deadline", v)} />
           <label className="span-2">
             <span>Цель работ</span>
             <textarea value={input.goal || ""} onChange={(e) => updateTzInput("goal", e.target.value)} rows={3} />
           </label>
         </div>
+        {showExample && <ExampleDialog template={template} onClose={() => setShowExample(false)} />}
 
         <div className="toggle-grid">
           <Toggle label="Исходные данные готовы" checked={!!input.source_data_ready} onChange={(v) => updateTzInput("source_data_ready", v)} />
@@ -725,10 +973,20 @@ function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstructio
           <Toggle label="Отдельный РС по субподряду" checked={!!input.separate_subcontract_estimate} onChange={(v) => updateTzInput("separate_subcontract_estimate", v)} />
         </div>
 
-        <label className="ai-instruction">
-          <span>Указание для ИИ (необязательно)</span>
-          <input value={tzInstruction} onChange={(e) => setTzInstruction(e.target.value)} placeholder="Напр.: сделать акцент на сроках и рисках" />
-        </label>
+        {input.requires_subcontractor && (
+          <TextInput label="Доля субподряда, %" type="number" value={input.subcontract_share_percent ?? ""}
+            onChange={(v) => updateTzInput("subcontract_share_percent", numOrNull(v))} />
+        )}
+
+        <StageEditor stages={tz.requisites?.stages || []} onChange={(stages) => updateTzReq("stages", stages)} />
+
+        <details className="editor-block">
+          <summary>Указание для DeepSeek</summary>
+          <label className="ai-instruction">
+            <span>Дополнительный контекст для генерации</span>
+            <input value={tzInstruction} onChange={(e) => setTzInstruction(e.target.value)} placeholder="Напр.: сделать акцент на сроках и рисках" />
+          </label>
+        </details>
 
         <div className="section-editor">
           {tz.sections.map((section) => (
@@ -740,16 +998,14 @@ function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstructio
       </section>
 
       <aside className="panel inspector">
-        <div className={`ready-meter ${readyClass}`}>
-          <span>Готовность</span>
-          <strong>{tz.ready_score}%</strong>
-        </div>
+        <OilGauge value={liveReady} className={readyClass} />
         <InfoGroup title="Статус"><div className="chips"><span>{statusLabels[tz.status] || tz.status}</span></div></InfoGroup>
         <InfoGroup title="Разделы">
           <div className="chips">
             <span>{tz.sections.filter((s) => s.content.trim()).length} из {tz.sections.length} заполнено</span>
           </div>
         </InfoGroup>
+        <ValidationPanel validation={validation} />
         {tz.notes?.length > 0 && <ReasonList title="Заметки ИИ" items={tz.notes} />}
         <InfoGroup title="Экспорт">
           <p className="muted">Итоговый документ — единый файл DOCX (без xlsx).</p>
@@ -761,17 +1017,60 @@ function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstructio
 
 function SectionEditor({ section, onChange, onGenerate, disabled }) {
   return (
-    <article className="section-card">
-      <div className="section-head">
+    <details className="section-card" open={!section.content.trim()}>
+      <summary className="section-head">
         <h5>{section.title}</h5>
         <span className={`source-badge ${section.source}`}>{sourceLabels[section.source] || section.source}</span>
-      </div>
-      <textarea value={section.content} onChange={(e) => onChange(e.target.value)} rows={5}
-        placeholder="Текст раздела — заполните вручную или нажмите «ИИ»." />
+      </summary>
+      <textarea value={section.content} onChange={(e) => onChange(e.target.value)} rows={6}
+        placeholder="Текст раздела — заполните вручную или используйте DeepSeek." />
       <div className="section-actions">
-        <button type="button" className="secondary" onClick={onGenerate} disabled={disabled}>ИИ: заполнить раздел</button>
+        <button type="button" className="secondary" onClick={onGenerate} disabled={disabled}>Заполнить раздел</button>
       </div>
-    </article>
+    </details>
+  );
+}
+
+function StageEditor({ stages, onChange }) {
+  const update = (index, value) => onChange(stages.map((stage, i) => (i === index ? value : stage)));
+  return (
+    <details className="editor-block">
+      <summary>Этапы и календарный план ({stages.length})</summary>
+      <div className="stage-editor">
+        {stages.map((stage, index) => (
+          <div key={`${index}-${stage}`}>
+            <span>{index + 1}</span>
+            <input value={stage} onChange={(event) => update(index, event.target.value)} />
+            <button type="button" className="icon-button" onClick={() => onChange(stages.filter((_, i) => i !== index))}>×</button>
+          </div>
+        ))}
+        <button type="button" className="secondary" onClick={() => onChange([...stages, "Новый этап"])}>Добавить этап</button>
+      </div>
+    </details>
+  );
+}
+
+function ValidationPanel({ validation }) {
+  if (!validation) return null;
+  const issues = validation.issues || [];
+  return (
+    <InfoGroup title="Проверка ТЗ">
+      <div className={`validation-summary ${validation.valid ? "valid" : "invalid"}`}>
+        <strong>{validation.valid ? "Проверка пройдена" : `${issues.length} замечаний`}</strong>
+        <span>{validation.issue_counts?.high || 0} критичных · {validation.issue_counts?.medium || 0} средних</span>
+      </div>
+      {issues.length > 0 && (
+        <div className="validation-list">
+          {issues.slice(0, 8).map((issue) => (
+            <article key={issue.code} className={`validation-item ${issue.severity}`}>
+              <strong>{issue.title}</strong>
+              <p>{issue.message}</p>
+              <small>{issue.recommendation}</small>
+            </article>
+          ))}
+        </div>
+      )}
+    </InfoGroup>
   );
 }
 
@@ -821,7 +1120,8 @@ function MyTzView({ documents, onOpen, onExport, onDelete, onRefresh, onNew }) {
   );
 }
 
-function RoadmapView({ products, productId, estimate, onSelect, hasTz, onEstimateTz }) {
+function RoadmapView({ products, productId, estimate, onSelect, hasTz, onEstimateTz,
+  selectedAdditionalServices, onToggleAdditional }) {
   return (
     <div className="grid">
       <section className="panel">
@@ -847,14 +1147,33 @@ function RoadmapView({ products, productId, estimate, onSelect, hasTz, onEstimat
           <>
             <div className="grid analytics-grid">
               <Metric label="Подрядчиков" value={estimate.summary.company_count} />
-              <Metric label="Быстрее всех, дн" value={estimate.summary.fastest_days} />
-              <Metric label="В среднем, дн" value={estimate.summary.average_days} />
-              <Metric label="Дольше всех, дн" value={estimate.summary.slowest_days} />
+              <Metric label="Минимальная стоимость" value={formatMoney(estimate.summary.lowest_cost_without_vat)} />
+              <Metric label="Средняя стоимость" value={formatMoney(estimate.summary.average_cost_without_vat)} />
+              <Metric label="Быстрее всех" value={`${estimate.summary.fastest_days} дн`} />
             </div>
             <div className="section-title">
               <span className="eyebrow">Продукт</span>
               <h4>{estimate.product_name}</h4>
             </div>
+            <p className="estimate-disclaimer">{estimate.summary.cost_disclaimer}</p>
+            {estimate.available_additional_services?.length > 0 && (
+              <details className="additional-services" open>
+                <summary>Дополнительные услуги из договоров ПРОСТОР</summary>
+                <p>Добавьте связанные работы — стоимость каждого подрядчика пересчитается автоматически.</p>
+                <div className="additional-service-grid">
+                  {estimate.available_additional_services.map((service) => (
+                    <label key={service.product_id} className={selectedAdditionalServices.includes(service.product_id) ? "selected" : ""}>
+                      <input type="checkbox" checked={selectedAdditionalServices.includes(service.product_id)}
+                        onChange={() => onToggleAdditional(service.product_id)} />
+                      <span>
+                        <strong>{service.name}</strong>
+                        <small>{service.common_company_count} подрядчиков · от {formatMoney(service.min_cost_without_vat)}</small>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </details>
+            )}
             <div className="roadmap-list">
               {estimate.companies.map((company, index) => (
                 <ContractorRoadmap key={company.company_id} company={company} rank={index + 1} />
@@ -880,8 +1199,9 @@ function ContractorRoadmap({ company, rank }) {
           </small>
         </div>
         <div className="contractor-est">
-          <strong>{company.estimated_days} дн</strong>
-          <small>~{company.estimated_months} мес · диапазон {company.min_days}–{company.max_days} дн</small>
+          <strong>{formatMoney(company.cost_without_vat)}</strong>
+          <small>без НДС · {company.estimated_days} дн · с НДС {formatMoney(company.cost_with_vat)}</small>
+          {company.additional_cost_without_vat > 0 && <small>допработы: +{formatMoney(company.additional_cost_without_vat)}</small>}
         </div>
       </div>
 
@@ -898,15 +1218,32 @@ function ContractorRoadmap({ company, rank }) {
         {company.stages.map((stage) => (
           <li key={stage.order}>
             <span className="rs-name">{stage.name}</span>
-            <span className="rs-days">{stage.days} дн ({stage.percent}%)</span>
+            <span className="rs-days">{stage.days} дн · {formatMoney(stage.estimated_cost_without_vat)}</span>
           </li>
         ))}
       </ol>
+      {company.additional_services?.length > 0 && (
+        <div className="contractor-addons">
+          {company.additional_services.map((service) => (
+            <span key={service.product_id}>{service.name}: +{formatMoney(service.cost_without_vat)}</span>
+          ))}
+        </div>
+      )}
     </article>
   );
 }
 
-function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend, isLoading, hasTz, onAugment, onFull }) {
+function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend, isLoading, hasTz, onAugment, onFull, status }) {
+  const messageListRef = useRef(null);
+
+  useEffect(() => {
+    if (!isOpen || !messageListRef.current) return;
+    messageListRef.current.scrollTo({
+      top: messageListRef.current.scrollHeight,
+      behavior: "smooth",
+    });
+  }, [messages, isLoading, isOpen]);
+
   if (!isOpen) return <button className="chat-fab" onClick={onToggle}>AI-чат</button>;
 
   const quickActions = [
@@ -922,6 +1259,9 @@ function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend,
         <div>
           <span className="eyebrow">AI-помощник</span>
           <h3>Чат по ТЗ</h3>
+          <small className={`provider-status ${status?.enabled ? "online" : "offline"}`}>
+            {status?.enabled ? `DeepSeek · ${status.model}` : "Локальные правила"}
+          </small>
         </div>
         <button className="icon-button" type="button" onClick={onToggle} aria-label="Скрыть чат">×</button>
       </header>
@@ -936,11 +1276,11 @@ function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend,
         ))}
       </div>
 
-      <div className="message-list">
+      <div className="message-list" ref={messageListRef}>
         {messages.map((message) => (
           <div className={`message ${message.role}`} key={message.id}>{message.text}</div>
         ))}
-        {isLoading && <div className="message assistant">...</div>}
+        {isLoading && <div className="message assistant message-loading" aria-label="ИИ готовит ответ"><i /><i /><i /></div>}
       </div>
 
       <form className="assistant-input" onSubmit={(e) => { e.preventDefault(); onSend(); }}>
@@ -981,11 +1321,11 @@ function AnalyticsView({ analytics }) {
   );
 }
 
-function TextInput({ label, value, onChange, type = "text" }) {
+function TextInput({ label, value, onChange, type = "text", placeholder = "" }) {
   return (
     <label>
       <span>{label}</span>
-      <input type={type} value={value} onChange={(e) => onChange(e.target.value)} />
+      <input type={type} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
     </label>
   );
 }

@@ -18,6 +18,7 @@ class TZTemplateSummary(BaseModel):
     product_id: str | None = None
     description: str = ""
     section_count: int = 0
+    source_files: list[str] = Field(default_factory=list)
 
 
 class TemplatesResponse(BaseModel):
@@ -61,8 +62,32 @@ class TZGenerateRequest(BaseModel):
     section_keys: list[str] | None = None
 
 
+class TZSwitchTemplateRequest(BaseModel):
+    template_key: str
+
+
+class TZValidationIssue(BaseModel):
+    code: str
+    severity: Literal["high", "medium", "low"]
+    title: str
+    message: str
+    recommendation: str
+    field: str | None = None
+    section_key: str | None = None
+
+
+class TZValidationResult(BaseModel):
+    valid: bool
+    ready_score: int = Field(ge=0, le=100)
+    filled_sections: int = 0
+    total_sections: int = 0
+    issue_counts: dict[str, int] = Field(default_factory=dict)
+    issues: list[TZValidationIssue] = Field(default_factory=list)
+
+
 class TZDocumentResponse(BaseModel):
     document: TZDocument
+    validation: TZValidationResult
 
 
 class TZDocumentSummary(BaseModel):

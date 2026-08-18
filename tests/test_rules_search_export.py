@@ -12,6 +12,7 @@ from backend.app.services.procurement import procurement_service
 from backend.app.services.search import search_service
 from backend.app.services.tz_generator import tz_generator
 from backend.app.services.tz_templates import tz_template_service
+from backend.app.services.tz_validation import tz_validation_service
 
 
 class ProstorMvpTest(unittest.TestCase):
@@ -76,8 +77,22 @@ class TZTemplatesTest(unittest.TestCase):
         self.assertEqual(len(templates), 11)
         for tpl in templates:
             self.assertTrue(tpl.sections, f"{tpl.key} без разделов")
+            self.assertTrue(tpl.example.get("stages"), f"{tpl.key} без примера")
         self.assertIsNotNone(tz_template_service.get_template("tz-ptd-opz"))
         self.assertIsNone(tz_template_service.get_template("does-not-exist"))
+
+    def test_template_types_have_distinct_dynamic_fields(self):
+        geology = tz_template_service.get_template("tz-geology-concept")
+        completion = tz_template_service.get_template("tz-integrated-completion")
+        geology_keys = {field.key for field in geology.fields}
+        completion_keys = {field.key for field in completion.fields}
+        self.assertIn("target_horizons", geology_keys)
+        self.assertNotIn("target_horizons", completion_keys)
+        self.assertIn("completion_type", completion_keys)
+        self.assertEqual(
+            next(field for field in completion.fields if field.key == "completion_type").input_type,
+            "select",
+        )
 
     def test_template_for_product_falls_back_to_universal(self):
         self.assertEqual(
@@ -169,6 +184,71 @@ class ProcurementEstimateTest(unittest.TestCase):
 
     def test_estimate_missing_product_returns_none(self):
         self.assertIsNone(procurement_service.estimate_product("no-such-product"))
+
+    def test_estimate_contains_explainable_cost_for_every_contractor(self):
+        product = procurement_service.list_products()[0]
+        estimate = procurement_service.estimate_product(product["product_id"])
+        self.assertIsNotNone(estimate)
+        self.assertGreater(estimate["summary"]["lowest_cost_without_vat"], 0)
+        self.assertIn("1 000", estimate["summary"]["cost_disclaimer"])
+        for company in estimate["companies"]:
+            self.assertGreater(company["cost_without_vat"], 0)
+            self.assertEqual(company["cost_confidence"], "indicative")
+            self.assertAlmostEqual(
+                company["cost_with_vat"],
+                company["cost_without_vat"] + company["vat_amount"],
+            )
+
+    def test_additional_service_recalculates_matching_contractors(self):
+        base = None
+        for product in procurement_service.list_products():
+            candidate = procurement_service.estimate_product(product["product_id"])
+            if candidate and candidate["available_additional_services"]:
+                base = candidate
+                break
+        self.assertIsNotNone(base)
+        addon_id = base["available_additional_services"][0]["product_id"]
+        recalculated = procurement_service.estimate_product(
+            base["product_id"], additional_product_ids=[addon_id]
+        )
+        self.assertEqual(recalculated["selected_additional_product_ids"], [addon_id])
+        affected = [c for c in recalculated["companies"] if c["additional_cost_without_vat"] > 0]
+        self.assertTrue(affected)
+        for company in affected:
+            self.assertEqual(
+                company["cost_without_vat"],
+                company["base_cost_without_vat"] + company["additional_cost_without_vat"],
+            )
+
+
+class TZValidationTest(unittest.TestCase):
+    def test_validation_returns_actionable_3d_and_required_field_issues(self):
+        template = tz_template_service.get_template("tz-ptd-reserves")
+        document = tz_generator.new_document(
+            template,
+            input_data=DraftInputData(needs_3d_model=True),
+        )
+        result = tz_validation_service.validate(document)
+        codes = {issue.code for issue in result.issues}
+        self.assertFalse(result.valid)
+        self.assertIn("missing_object_name", codes)
+        self.assertIn("3d_missing_input_data", codes)
+        self.assertTrue(all(issue.recommendation for issue in result.issues))
+
+    def test_template_specific_required_field_is_validated_and_used(self):
+        template = tz_template_service.get_template("tz-geology-concept")
+        document = tz_generator.new_document(
+            template,
+            object_name="Северный участок",
+            customer_name="Блок геологии",
+            input_data=DraftInputData(goal="Уточнить строение", deadline="2026-12-20"),
+        )
+        result = tz_validation_service.validate(document)
+        self.assertIn("missing_template_field_target_horizons", {i.code for i in result.issues})
+        document.requisites["target_horizons"] = "Юрские пласты Ю1–Ю4"
+        tz_generator.generate(document, mode="full", template=template)
+        scope = next(section.content for section in document.sections if section.key == "scope")
+        self.assertIn("Юрские пласты Ю1–Ю4", scope)
 
 
 if __name__ == "__main__":

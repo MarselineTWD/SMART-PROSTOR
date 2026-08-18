@@ -1,10 +1,11 @@
-# syntax=docker/dockerfile:1.7
 FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=10 \
     HF_HOME=/opt/hf-cache \
     SENTENCE_TRANSFORMERS_HOME=/opt/hf-cache
 
@@ -15,7 +16,8 @@ RUN apt-get update \
 WORKDIR /app
 
 # CPU-only torch wheel keeps the image ~1.5GB smaller than the default CUDA build.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2.0,<3.0.0"
+RUN pip install --timeout 300 --retries 10 \
+    --index-url https://download.pytorch.org/whl/cpu "torch>=2.2.0,<3.0.0"
 
 COPY pyproject.toml ./
 RUN pip install \
