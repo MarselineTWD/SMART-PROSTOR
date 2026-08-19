@@ -28,19 +28,31 @@ _SYSTEM = (
     "Ты — ассистент-конструктор технических заданий ПРОСТОР для нефтегазовых работ.\n"
     "ФОРМАТ ОТВЕТА: верни СТРОГО один JSON-объект с ключами "
     '"reply", "suggestions", "field_updates", "warnings". Никакого текста вне JSON.\n'
-    "- reply: строка на русском, максимум 3 коротких предложения, деловой тон, "
+    "- reply: строка на русском, максимум 2 коротких предложения, деловой тон, "
     "без markdown, эмодзи, маркированных списков и лишних символов.\n"
     "- suggestions: до 4 коротких подсказок-действий (массив строк).\n"
     "- field_updates: массив значений, извлечённых из диалога для заполнения ТЗ. "
     'Каждый элемент — объект {"target", "key", "value", "confidence", "evidence"}. '
     "target и key бери ТОЛЬКО из списка разрешённых полей. value — итоговое значение "
-    "(для флагов true/false, для процента — число). confidence — число 0..1. "
+    "(для флагов true/false, для процента — число, для поля типа services — массив "
+    "объектов с ключом name). confidence — число 0..1. "
     "evidence — короткая цитата из сообщения пользователя.\n"
     "- warnings: массив строк с предупреждениями (недостающие данные, критичные "
     "замечания из validation_issues).\n"
-    "ПРАВИЛА: опирайся только на переданный контекст и диалог; не выдумывай договорные "
-    "ставки, сроки, факты и результаты проверок; денежные оценки называй индикативными; "
-    "если данных не хватает — задай уточняющий вопрос в reply и не заполняй это поле."
+    "ПРАВИЛА РАБОТЫ: весь объект tz/current_document в контексте — это актуальные поля "
+    "конструктора; обязательно учитывай каждое заполненное поле и не спрашивай его повторно. "
+    "История диалога равноправна полям конструктора. Из каждого сообщения сразу извлекай "
+    "все возможные field_updates — интерфейс применит их автоматически. Если пользователь "
+    "просит собрать, создать, сформировать или заполнить ТЗ, не отправляй его к кнопкам: "
+    "верни максимум доступных правок по всему контексту, а разделы сформирует интерфейс. "
+    "Не устраивай анкетирование: допускается не более ОДНОГО короткого вопроса и только если "
+    "без ответа нельзя безопасно продолжить. Некритичные пробелы оставляй как предупреждения. "
+    "Заказчик, исполнитель и номер договора никогда не блокируют заполнение черновика: не "
+    "спрашивай их, если пользователь сам не обсуждает эти реквизиты. Если уже нашёл хотя бы "
+    "одно значение для field_updates, в reply сообщи о действии без вопроса. "
+    "Особые условия из knowledge_base.exceptional_conditions используй только для сверки и "
+    "предупреждения о совпадении/конфликте, не копируй без подтверждения пользователя. "
+    "Не выдумывай договорные ставки, сроки и факты; денежные оценки называй индикативными."
 )
 
 
@@ -78,7 +90,8 @@ class AssistantService:
             parsed = self._llm_structured(message, context, history, allowed_fields)
             if parsed is not None:
                 return self._postprocess(parsed, allowed_fields), "deepseek", False
-        return self._fallback(message, context), "rules", settings.llm_enabled
+        fallback_reply = self._fallback(message, context, allowed_fields, history)
+        return self._postprocess(fallback_reply, allowed_fields), "rules", settings.llm_enabled
 
     # --- LLM с валидацией и одним повтором ------------------------------------
 
@@ -95,7 +108,7 @@ class AssistantService:
                 "\nПРЕДЫДУЩИЙ ОТВЕТ БЫЛ НЕВАЛИДНЫМ. Верни только корректный JSON-объект "
                 "с указанными ключами."
             )
-            data = llm_complete_json(system, prompt, temperature=0.2)
+            data = llm_complete_json(system, prompt, temperature=0.15, max_tokens=1800)
             if data is None:
                 return None
             try:
@@ -136,6 +149,13 @@ class AssistantService:
         reply.suggestions = _clean_list(reply.suggestions, limit=4, item_limit=80)
         reply.warnings = _clean_list(reply.warnings, limit=6, item_limit=200)
         reply.field_updates = self._whitelist(reply.field_updates, allowed_fields)
+        if reply.field_updates:
+            reply.reply = re.sub(
+                r"(?:уточните|укажите|сообщите|подскажите)[^.?!]*(?:[.?!]|$)",
+                "Недостающие некритичные реквизиты отмечены в предупреждениях.",
+                reply.reply,
+                flags=re.IGNORECASE,
+            ).strip()
         if not reply.reply and reply.field_updates:
             reply.reply = "Предлагаю заполнить поля ТЗ значениями из диалога — проверьте и примените."
         return reply
@@ -160,34 +180,93 @@ class AssistantService:
             u.confidence = max(0.0, min(1.0, float(u.confidence or 0.0)))
             u.applied = False
             kept.append(u)
-        return kept[:12]
+        return kept[:40]
 
     # --- Детерминированный fallback (без сети) --------------------------------
 
-    def _fallback(self, message: str, context: dict) -> AssistantReply:
+    def _fallback(
+        self,
+        message: str,
+        context: dict,
+        allowed_fields: list[AllowedField] | None = None,
+        history: list[tuple[str, str]] | None = None,
+    ) -> AssistantReply:
         text = message.lower()
+        user_history = [item for role, item in (history or []) if role == "user"]
+        conversation = "\n".join([*user_history[-8:], message])
         draft = context.get("draft") or {}
         product = context.get("selected_product") or {}
         tz = context.get("tz") or {}
-        suggestions = ["Что уточнить для ТЗ?", "Проверь готовность", "Дополнить ИИ"]
+        knowledge = context.get("knowledge_base") or {}
+        recommended = knowledge.get("recommended_templates") or []
+        similar = knowledge.get("similar_created_tz") or []
+        suggestions = ["Подбери тип ТЗ", "Найди похожие ТЗ", "Что ещё заполнить?"]
+        updates: list[TZFieldUpdate] = []
+
+        allowed = {(field.target, field.key): field for field in (allowed_fields or [])}
+        date_match = re.search(r"\b(20\d{2})[-./](\d{1,2})[-./](\d{1,2})\b", conversation)
+        if date_match and ("input_data", "deadline") in allowed:
+            year, month, day = date_match.groups()
+            updates.append(TZFieldUpdate(
+                target="input_data", key="deadline",
+                value=f"{year}-{int(month):02d}-{int(day):02d}", confidence=0.95,
+                evidence=date_match.group(0),
+            ))
+        object_match = re.search(
+            r"(?:объект|месторождение|скважина|участок)\s*[:—-]?\s*([^,.\n]{3,80})",
+            conversation,
+            flags=re.IGNORECASE,
+        )
+        if object_match and ("document", "object_name") in allowed:
+            updates.append(TZFieldUpdate(
+                target="document", key="object_name", value=object_match.group(1).strip(),
+                confidence=0.82, evidence=object_match.group(0),
+            ))
+        city_match = re.search(
+            r"(?:место работ|локация|город|регион)\s*[:—-]?\s*([^,.\n]{2,80})",
+            conversation,
+            flags=re.IGNORECASE,
+        )
+        if city_match and ("requisites", "city") in allowed:
+            updates.append(TZFieldUpdate(
+                target="requisites", key="city", value=city_match.group(1).strip(),
+                confidence=0.86, evidence=city_match.group(0),
+            ))
+        if any(word in text for word in ("нужно", "цель", "требуется", "подготовить")) \
+                and ("input_data", "goal") in allowed:
+            updates.append(TZFieldUpdate(
+                target="input_data", key="goal", value=message.strip(),
+                confidence=0.72, evidence=message[:180],
+            ))
+        if "3d" in text and ("input_data", "needs_3d_model") in allowed:
+            updates.append(TZFieldUpdate(
+                target="input_data", key="needs_3d_model", value=True,
+                confidence=0.9, evidence="3D",
+            ))
+        if "субподряд" in text and ("input_data", "requires_subcontractor") in allowed:
+            denied = any(phrase in text for phrase in ("не разреш", "запрет", "без субподряд", "не нужен", "не требуется"))
+            updates.append(TZFieldUpdate(
+                target="input_data", key="requires_subcontractor", value=not denied,
+                confidence=0.88, evidence="субподряд",
+            ))
 
         if ("дополн" in text or "заполн" in text) and ("тз" in text or "раздел" in text or tz or draft):
-            reply = (
-                "Дополню пустые разделы ТЗ по текущим данным. Нажмите «Дополнить с ИИ» — "
-                "заполню недостающие разделы, уже заполненные не трону."
-            )
+            reply = "Переношу данные диалога в поля и дополняю пустые разделы текущего ТЗ."
         elif "сгенерир" in text or "полност" in text or "сделай тз" in text or "напиши тз" in text:
-            reply = (
-                "Соберу ТЗ целиком по выбранному шаблону и введённым данным. "
-                "Нажмите «Сгенерировать полностью» — перезапишу все разделы связным текстом."
-            )
+            reply = "Собираю ТЗ целиком по полям и всей истории диалога."
         elif "шаблон" in text or "переключ" in text:
             reply = (
                 "Шаблон ТЗ можно переключить в конструкторе: доступны ПТД, ОПЗ, концепты "
                 "геологии/обустройства/развития/заканчивания, сопровождение и универсальная форма."
             )
         elif "уточ" in text or "вопрос" in text:
-            reply = "Уточните объект, цель, срок, исходные данные и субподряд."
+            missing = []
+            if not (tz.get("object_name") or draft.get("object_name")):
+                missing.append("объект")
+            input_data = tz.get("input_data") or draft.get("input_data") or {}
+            if not input_data.get("goal"):
+                missing.append("цель")
+            reply = f"Для продолжения достаточно уточнить: {', '.join(missing[:2])}." if missing else "Критичных уточнений нет — могу собирать ТЗ."
         elif "провер" in text or "риск" in text or "готов" in text:
             if not tz and not draft:
                 reply = "ТЗ ещё не создано."
@@ -210,12 +289,23 @@ class AssistantService:
                 reply = f"{product.get('name')}. {product.get('summary')}"
             else:
                 reply = "Сначала выберите продукт."
+        elif any(word in text for word in ("подбери", "тип тз", "похож", "аналог")):
+            if recommended:
+                first = recommended[0]
+                similar_note = f" Нашёл {len(similar)} похожих ранее созданных ТЗ." if similar else ""
+                reply = (
+                    f"По каталогу лучше всего подходит «{first['template_name']}»."
+                    f"{similar_note} Проверьте предложенные значения и тип ТЗ в конструкторе."
+                )
+            else:
+                reply = "В базе нет уверенного совпадения. Уточните объект, результат и состав работ."
         elif "сформ" in text or "тз" in text:
-            reply = "Нажмите «Сформировать ТЗ»." if product else "Сначала выберите продукт."
+            reply = "Заполните единый конструктор; ТЗ будет создано один раз финальной кнопкой."
         else:
-            reply = "Могу найти услугу, проверить готовность, дополнить или полностью сгенерировать ТЗ."
+            history_note = f" В базе учтено ранее созданных ТЗ: {knowledge.get('created_tz_count', 0)}."
+            reply = "Могу подобрать тип по базе, заполнить поля, проверить готовность и рассчитать подрядчиков." + history_note
 
-        return AssistantReply(reply=reply, suggestions=suggestions)
+        return AssistantReply(reply=reply, suggestions=suggestions, field_updates=updates)
 
 
 # --- Утилиты очистки текста ---------------------------------------------------

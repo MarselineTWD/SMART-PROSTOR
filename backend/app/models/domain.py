@@ -171,6 +171,17 @@ class TZDocumentSection(BaseModel):
     source: SectionSource = "template"
 
 
+class TZEvaluation(BaseModel):
+    rating: int | None = Field(default=None, ge=1, le=5)
+    comment: str = Field(default="", max_length=4000)
+
+
+class TZFeedback(BaseModel):
+    contractor: TZEvaluation = Field(default_factory=TZEvaluation)
+    ai_tz: TZEvaluation = Field(default_factory=TZEvaluation)
+    ai_chat: TZEvaluation = Field(default_factory=TZEvaluation)
+
+
 # --- Чат-ассистент по ТЗ ------------------------------------------------------
 
 FieldTarget = Literal["document", "input_data", "requisites", "section"]
@@ -219,6 +230,8 @@ class TZDocument(BaseModel):
     sections: list[TZDocumentSection] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     chat: list[TZChatMessage] = Field(default_factory=list)
+    ai_initially_generated: bool = False
+    feedback: TZFeedback = Field(default_factory=TZFeedback)
     storage_key: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None

@@ -44,11 +44,16 @@ INTENT_KEYWORDS: dict[IntentType, set[str]] = {
 W_SEMANTIC = 0.70
 W_BUSINESS = 0.30
 CANDIDATE_POOL = 20  # top-K products fetched from pgvector before rerank
+_STOPWORDS = {
+    "а", "без", "бы", "в", "во", "для", "до", "же", "и", "из", "к", "как",
+    "на", "над", "не", "но", "о", "об", "от", "по", "под", "при", "с", "со",
+    "у", "хочу", "нужно", "надо", "можно", "пожалуйста",
+}
 
 
 class SearchService:
     def detect_intent(self, query: str) -> IntentType:
-        tokens = set(self._tokenize(query))
+        tokens = self._query_tokens(query)
         scores = {
             intent: len(tokens & keywords)
             for intent, keywords in INTENT_KEYWORDS.items()
@@ -66,7 +71,7 @@ class SearchService:
         if not query:
             return SearchContext(query="", detected_intent="service_search", products=[])
 
-        tokens = set(self._tokenize(query))
+        tokens = self._query_tokens(query)
         detected_intent = self.detect_intent(query)
         results = self._rank_products(
             query=query,
@@ -356,7 +361,19 @@ class SearchService:
     @staticmethod
     def _tokenize(text: str) -> list[str]:
         normalized = re.sub(r"[^0-9A-Za-zА-Яа-яЁё]+", " ", text.lower())
-        return [token for token in normalized.split() if token]
+        return [token for token in normalized.split() if token and token not in _STOPWORDS]
+
+    @staticmethod
+    def _query_tokens(text: str) -> set[str]:
+        tokens = set(SearchService._tokenize(text))
+        lowered = text.lower()
+        if any(marker in lowered for marker in ("запас", "подсчит", "подсчёт", "подсчет")):
+            tokens.update({"запасы", "подсчёт", "подсчет", "оценка", "птд"})
+        if "скважин" in lowered:
+            tokens.update({"скважина", "скважин", "геология"})
+        if "геолог" in lowered:
+            tokens.update({"геология", "геологический"})
+        return tokens
 
     def _recommendations(self, intent: IntentType) -> list[str]:
         base = [

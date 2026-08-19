@@ -6,15 +6,56 @@ import {
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
 const AI_CHAT_ENDPOINT = import.meta.env.VITE_AI_CHAT_ENDPOINT ?? `${API_BASE}/assistant/chat`;
+const LOCAL_DRAFT_KEY = "prostor:unsaved-tz:v1";
+
+function readLocalDraft() {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(LOCAL_DRAFT_KEY) || "null");
+    return value?.version === 1 && value.document?.template_key ? value : null;
+  } catch {
+    window.localStorage.removeItem(LOCAL_DRAFT_KEY);
+    return null;
+  }
+}
+
+function clearLocalDraft() {
+  try { window.localStorage.removeItem(LOCAL_DRAFT_KEY); } catch { /* storage недоступен */ }
+}
 
 const CHAT_GREETING = {
   id: "assistant-start",
   role: "assistant",
-  text: "Готов помочь с ТЗ. Опишите объект, цель и сроки — предложу заполнить поля.",
+  text: "Опишите задачу одним сообщением или напишите «собери ТЗ». Я учту все поля конструктора, диалог и особые условия из базы, затем сам перенесу данные в черновик.",
   suggestions: [],
   field_updates: [],
   warnings: [],
 };
+
+function applyUpdatesToDocument(document, updates = []) {
+  if (!document) return document;
+  const next = structuredClone(document);
+  next.input_data ||= {};
+  next.requisites ||= {};
+  next.sections ||= [];
+  for (const update of updates) {
+    if (update.target === "document") next[update.key] = update.value;
+    if (update.target === "input_data") next.input_data[update.key] = update.value;
+    if (update.target === "requisites") next.requisites[update.key] = update.value;
+    if (update.target === "section") {
+      const section = next.sections.find((item) => item.key === update.key);
+      if (section) { section.content = String(update.value); section.source = "ai"; }
+    }
+  }
+  return next;
+}
+
+function requestedGenerationMode(message) {
+  const text = message.toLowerCase();
+  if (!/(тз|техническ\w* задан)/i.test(text)) return null;
+  if (/(собер|созда|сформир|сгенерир|сделай|напиш|полност)/i.test(text)) return "full";
+  if (/(заполн|дополн)/i.test(text)) return "augment";
+  return null;
+}
 
 function normalizeChatMessage(message) {
   return {
@@ -24,6 +65,9 @@ function normalizeChatMessage(message) {
     suggestions: message.suggestions || [],
     field_updates: message.field_updates || [],
     warnings: message.warnings || [],
+    discovery: message.discovery || null,
+    provider: message.provider,
+    fallback: Boolean(message.fallback),
   };
 }
 
@@ -31,6 +75,7 @@ function formatUpdateValue(value) {
   if (value === true) return "Да";
   if (value === false) return "Нет";
   if (value === null || value === undefined) return "—";
+  if (Array.isArray(value)) return value.map((item) => typeof item === "object" ? item.name : item).filter(Boolean).join(", ");
   return String(value);
 }
 
@@ -136,15 +181,15 @@ function TemplateFields({ fields, values, onChange }) {
   };
 
   return Object.entries(groups).map(([group, groupFields]) => (
-    <details className="template-field-group span-2" key={group} open={groupFields.some((field) => field.required)}>
-      <summary>
+    <section className="template-field-group span-2 fields-always-open" key={group}>
+      <header>
         <span>{group}</span>
         <small>{groupFields.filter((field) => field.required).length
           ? `обязательных: ${groupFields.filter((field) => field.required).length}`
           : `${groupFields.length} полей`}</small>
-      </summary>
+      </header>
       <div className="form-grid">{groupFields.map(renderField)}</div>
-    </details>
+    </section>
   ));
 }
 
@@ -165,6 +210,7 @@ function ExampleDialog({ template, onClose }) {
           <div><dt>Срок</dt><dd>{example.deadline}</dd></div>
         </dl>
         <h4>Пример структуры работ</h4>
+        <p className="muted">Это базовый пример. Фактические услуги и количество этапов ИИ пересобирает по параметрам конкретного ТЗ.</p>
         <ol>{(example.stages || []).map((stage) => <li key={stage}>{stage}</li>)}</ol>
         <div className="example-result"><strong>Ожидаемый результат</strong><p>{example.result}</p></div>
         <button onClick={onClose}>Понятно</button>
@@ -195,7 +241,7 @@ export default function App() {
   const requestedTab = urlParams.get("tab");
   const requestedTzId = urlParams.get("tz");
   const [activeTab, setActiveTab] = useState(
-    ["search", "constructor", "mytz", "roadmap", "analytics"].includes(requestedTab) ? requestedTab : "search",
+    ["constructor", "mytz", "analytics"].includes(requestedTab) ? requestedTab : "constructor",
   );
   const [status, setStatus] = useState("Готов к демонстрации");
   const [isLoading, setIsLoading] = useState(false);
@@ -210,7 +256,9 @@ export default function App() {
   const [templateDetails, setTemplateDetails] = useState({});
   const [tzList, setTzList] = useState([]);
   const [currentTz, setCurrentTz] = useState(null);
+  const [isNewDraft, setIsNewDraft] = useState(true);
   const [validation, setValidation] = useState(null);
+  const validationRequestRef = useRef(0);
   const [newTz, setNewTz] = useState(emptyNewTz);
   const [tzInstruction, setTzInstruction] = useState("");
   const [tzBusy, setTzBusy] = useState(false);
@@ -232,15 +280,27 @@ export default function App() {
   const results = searchResponse?.results?.products ?? [];
 
   useEffect(() => {
-    runSearch(demoQuery);
     loadAnalytics();
     loadContractorAnalytics();
     loadTemplates();
     loadTzList();
-    loadEstProducts();
     loadAssistantStatus();
     if (requestedTzId) openTz(requestedTzId);
   }, []);
+
+  useEffect(() => {
+    if (!currentTz || !isNewDraft) return;
+    try {
+      window.localStorage.setItem(LOCAL_DRAFT_KEY, JSON.stringify({
+        version: 1,
+        updated_at: new Date().toISOString(),
+        document: currentTz,
+        validation,
+      }));
+    } catch {
+      // Конструктор продолжит работать, даже если браузер запретил localStorage.
+    }
+  }, [currentTz, validation, isNewDraft]);
 
   async function request(path, options = {}) {
     const response = await fetch(`${API_BASE}${path}`, {
@@ -309,8 +369,35 @@ export default function App() {
       const details = await Promise.all(
         data.templates.map((template) => request(`/tz/templates/${template.key}`).catch(() => null)),
       );
-      setTemplateDetails(Object.fromEntries(details.filter(Boolean).map((item) => [item.template.key, item.template])));
+      const detailMap = Object.fromEntries(details.filter(Boolean).map((item) => [item.template.key, item.template]));
+      setTemplateDetails(detailMap);
       setNewTz((current) => ({ ...current, template_key: current.template_key || data.templates[0]?.key || "" }));
+      if (!requestedTzId) {
+        const localDraft = readLocalDraft();
+        if (localDraft && data.templates.some((template) => template.key === localDraft.document.template_key)) {
+          setCurrentTz(localDraft.document);
+          setValidation(localDraft.validation);
+          setIsNewDraft(true);
+          setStatus("Несохранённый черновик восстановлен");
+          return;
+        }
+        const firstKey = data.templates[0]?.key;
+        if (firstKey) {
+          const preview = await request("/tz/preview", {
+            method: "POST",
+            body: JSON.stringify({
+              template_key: firstKey,
+              customer_name: emptyInput.customer_name,
+              input_data: buildInputPayload(emptyInput),
+              requisites: {},
+              auto_fill: false,
+            }),
+          });
+          setCurrentTz(preview.document);
+          setValidation(preview.validation);
+          setIsNewDraft(true);
+        }
+      }
     } catch (error) {
       setStatus(`Не удалось загрузить шаблоны: ${error.message}`);
     }
@@ -359,21 +446,63 @@ export default function App() {
     };
   }
 
-  async function createTz() {
-    if (!newTz.template_key) return;
+  async function startNewDraft(templateKey = templates[0]?.key) {
+    if (!templateKey) return;
     setTzBusy(true);
-    setStatus("Создаю ТЗ по шаблону");
     try {
-      const data = await request("/tz", {
+      const data = await request("/tz/preview", {
         method: "POST",
-        body: JSON.stringify(buildCreatePayload(newTz, newTz.template_key, newTz.auto_fill)),
+        body: JSON.stringify({
+          template_key: templateKey,
+          customer_name: emptyInput.customer_name,
+          input_data: buildInputPayload(emptyInput),
+          requisites: {},
+          auto_fill: false,
+        }),
       });
       setCurrentTz(data.document);
       setValidation(data.validation);
       setEstimate(null);
       setSelectedAdditionalServices([]);
+      setChatMessages([CHAT_GREETING]);
+      clearLocalDraft();
+      setIsNewDraft(true);
       setActiveTab("constructor");
-      setStatus(newTz.auto_fill ? "ТЗ создано и заполнено ИИ" : "ТЗ создано");
+      setStatus("Новый черновик открыт — запись в БД ещё не создана");
+    } catch (error) {
+      setStatus(`Не удалось открыть конструктор: ${error.message}`);
+    } finally {
+      setTzBusy(false);
+    }
+  }
+
+  async function createTz() {
+    if (!currentTz) return;
+    setTzBusy(true);
+    setStatus("Финально создаю ТЗ");
+    try {
+      const data = await request("/tz", {
+        method: "POST",
+        body: JSON.stringify({
+          template_key: currentTz.template_key,
+          product_id: currentTz.product_id,
+          title: currentTz.title,
+          object_name: currentTz.object_name,
+          customer_name: currentTz.customer_name,
+          executor_name: currentTz.executor_name,
+          contract_name: currentTz.contract_name,
+          input_data: buildInputPayload(currentTz.input_data || emptyInput),
+          requisites: currentTz.requisites || {},
+          sections: currentTz.sections || [],
+          ai_initially_generated: Boolean(currentTz.ai_initially_generated),
+          auto_fill: false,
+        }),
+      });
+      setCurrentTz(data.document);
+      setValidation(data.validation);
+      clearLocalDraft();
+      setIsNewDraft(false);
+      setStatus("ТЗ создано и сохранено");
       loadTzList();
     } catch (error) {
       setStatus(`Ошибка создания ТЗ: ${error.message}`);
@@ -411,6 +540,7 @@ export default function App() {
       setValidation(data.validation);
       setEstimate(null);
       setSelectedAdditionalServices([]);
+      setIsNewDraft(false);
       setActiveTab("constructor");
       loadChatHistory(id);
     } catch (error) {
@@ -430,6 +560,10 @@ export default function App() {
 
   async function saveTz(silent = false) {
     if (!currentTz) return null;
+    if (isNewDraft) {
+      if (!silent) setStatus("Черновик хранится в конструкторе и будет создан финальной кнопкой");
+      return currentTz;
+    }
     const payload = {
       title: currentTz.title,
       object_name: currentTz.object_name,
@@ -440,6 +574,7 @@ export default function App() {
       input_data: buildInputPayload(currentTz.input_data),
       requisites: currentTz.requisites,
       sections: currentTz.sections.map((s) => ({ key: s.key, title: s.title, content: s.content, source: s.source })),
+      ai_initially_generated: Boolean(currentTz.ai_initially_generated),
     };
     const data = await request(`/tz/${currentTz.id}`, { method: "PUT", body: JSON.stringify(payload) });
     setCurrentTz(data.document);
@@ -451,20 +586,23 @@ export default function App() {
     return data.document;
   }
 
-  async function generateTz(mode, sectionKeys = null, instruction = tzInstruction) {
+  async function generateTz(mode, sectionKeys = null, instruction = tzInstruction, planOnly = false) {
     if (!currentTz) return;
     setTzBusy(true);
     setStatus(mode === "full" ? "ИИ генерирует ТЗ целиком" : "ИИ дополняет разделы");
     try {
-      await saveTz(true);
-      const data = await request(`/tz/${currentTz.id}/generate`, {
+      if (!isNewDraft) await saveTz(true);
+      const data = await request(isNewDraft ? "/tz/preview/generate" : `/tz/${currentTz.id}/generate`, {
         method: "POST",
-        body: JSON.stringify({ mode, instruction: instruction || null, section_keys: sectionKeys }),
+        body: JSON.stringify({
+          ...(isNewDraft ? { document: currentTz } : {}),
+          mode, instruction: instruction || null, section_keys: sectionKeys, plan_only: planOnly,
+        }),
       });
       setCurrentTz(data.document);
       setValidation(data.validation);
       setStatus(`Готовность ТЗ: ${data.document.ready_score}%`);
-      loadTzList();
+      if (!isNewDraft) loadTzList();
     } catch (error) {
       setStatus(`Ошибка генерации: ${error.message}`);
     } finally {
@@ -478,14 +616,25 @@ export default function App() {
     setTzBusy(true);
     setStatus("Меняю шаблон ТЗ");
     try {
-      const data = await request(`/tz/${currentTz.id}/switch-template`, {
+      const data = await request(isNewDraft ? "/tz/preview" : `/tz/${currentTz.id}/switch-template`, {
         method: "POST",
-        body: JSON.stringify({ template_key: templateKey }),
+        body: JSON.stringify(isNewDraft ? {
+          template_key: templateKey,
+          title: currentTz.title,
+          object_name: currentTz.object_name,
+          customer_name: currentTz.customer_name,
+          executor_name: currentTz.executor_name,
+          contract_name: currentTz.contract_name,
+          input_data: currentTz.input_data,
+          requisites: currentTz.requisites,
+          auto_fill: false,
+        } : { template_key: templateKey }),
       });
       setCurrentTz(data.document);
       setValidation(data.validation);
       setStatus("Шаблон изменён");
-      loadTzList();
+      setEstimate(null);
+      if (!isNewDraft) loadTzList();
     } catch (error) {
       setStatus(`Ошибка смены шаблона: ${error.message}`);
     } finally {
@@ -493,20 +642,26 @@ export default function App() {
     }
   }
 
-  async function validateCurrentTz() {
+  async function validateCurrentTz({ silent = false } = {}) {
     if (!currentTz) return;
-    setTzBusy(true);
-    setStatus("Проверяю ТЗ по обязательным полям и бизнес-правилам");
+    const requestId = ++validationRequestRef.current;
+    if (!silent) {
+      setTzBusy(true);
+      setStatus("Проверяю ТЗ по обязательным полям и бизнес-правилам");
+    }
     try {
-      const saved = await saveTz(true);
-      const result = await request(`/tz/${saved.id}/validate`, { method: "POST" });
+      const result = await request("/tz/preview/validate", {
+        method: "POST",
+        body: JSON.stringify(currentTz),
+      });
+      if (requestId !== validationRequestRef.current) return;
       setValidation(result);
       setCurrentTz((current) => ({ ...current, ready_score: result.ready_score }));
-      setStatus(result.valid ? "ТЗ прошло проверку" : `Найдено замечаний: ${result.issues.length}`);
+      if (!silent) setStatus(result.valid ? "ТЗ прошло проверку" : `Найдено замечаний: ${result.issues.length}`);
     } catch (error) {
-      setStatus(`Ошибка проверки ТЗ: ${error.message}`);
+      if (requestId === validationRequestRef.current) setStatus(`Ошибка проверки ТЗ: ${error.message}`);
     } finally {
-      setTzBusy(false);
+      if (!silent && requestId === validationRequestRef.current) setTzBusy(false);
     }
   }
 
@@ -533,17 +688,18 @@ export default function App() {
   }
 
   function updateTzField(field, value) {
-    setCurrentTz((current) => ({ ...current, [field]: value }));
+    setCurrentTz((current) => ({ ...current, status: current.status === "ready" ? "draft" : current.status, [field]: value }));
   }
   function updateTzInput(key, value) {
-    setCurrentTz((current) => ({ ...current, input_data: { ...current.input_data, [key]: value } }));
+    setCurrentTz((current) => ({ ...current, status: current.status === "ready" ? "draft" : current.status, input_data: { ...current.input_data, [key]: value } }));
   }
   function updateTzReq(key, value) {
-    setCurrentTz((current) => ({ ...current, requisites: { ...current.requisites, [key]: value } }));
+    setCurrentTz((current) => ({ ...current, status: current.status === "ready" ? "draft" : current.status, requisites: { ...current.requisites, [key]: value } }));
   }
   function updateSection(key, content) {
     setCurrentTz((current) => ({
       ...current,
+      status: current.status === "ready" ? "draft" : current.status,
       sections: current.sections.map((s) => (s.key === key ? { ...s, content, source: "manual" } : s)),
     }));
   }
@@ -566,15 +722,19 @@ export default function App() {
 
   async function estimateForCurrentTz(additionalIds = []) {
     if (!currentTz) return;
+    const serviceIds = Array.isArray(additionalIds) ? additionalIds : selectedAdditionalServices;
     setStatus("Сохраняю ТЗ и рассчитываю его этапы");
     try {
-      await saveTz(true);
-      const query = additionalIds.map((id) => `additional_product_ids=${encodeURIComponent(id)}`).join("&");
-      const data = await request(`/estimates/for-tz/${currentTz.id}${query ? `?${query}` : ""}`, { method: "POST" });
-      setActiveTab("roadmap");
+      if (!isNewDraft) await saveTz(true);
+      const query = serviceIds.map((id) => `additional_product_ids=${encodeURIComponent(id)}`).join("&");
+      const path = isNewDraft ? "/estimates/for-draft" : `/estimates/for-tz/${currentTz.id}`;
+      const data = await request(`${path}${query ? `?${query}` : ""}`, {
+        method: "POST",
+        ...(isNewDraft ? { body: JSON.stringify(currentTz) } : {}),
+      });
       if (data.estimate) {
         setEstimate(data.estimate);
-        setSelectedAdditionalServices(additionalIds);
+        setSelectedAdditionalServices(serviceIds);
         setStatus(`Роадмап рассчитан по этапам ТЗ: ${data.estimate.summary.company_count} подрядчиков`);
       } else {
         setEstimate(null);
@@ -585,14 +745,72 @@ export default function App() {
     }
   }
 
+  function addCustomSection(title) {
+    const cleanTitle = title.trim();
+    if (!cleanTitle) return;
+    const key = `custom-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    setCurrentTz((current) => ({
+      ...current,
+      status: current.status === "ready" ? "draft" : current.status,
+      sections: [...current.sections, { key, title: cleanTitle, content: "", source: "manual" }],
+    }));
+    setStatus(`Добавлен раздел «${cleanTitle}» — его название будет передано ИИ`);
+  }
+
+  function removeCustomSection(key) {
+    setCurrentTz((current) => ({
+      ...current,
+      status: current.status === "ready" ? "draft" : current.status,
+      sections: current.sections.filter((section) => section.key !== key),
+    }));
+  }
+
+  async function saveTzFeedback(id, payload) {
+    const data = await request(`/tz/${id}/feedback`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    setCurrentTz((current) => current?.id === id ? data.document : current);
+    await loadTzList();
+    setStatus("Оценки сохранены — спасибо за обратную связь");
+    return data.document;
+  }
+
+  async function selectContractorAndComplete(company) {
+    if (!currentTz || !company) return;
+    if (!validation?.valid || validation.ready_score < 100) {
+      setStatus("Сначала заполните и проверьте ТЗ до 100%");
+      return;
+    }
+    setTzBusy(true);
+    setStatus(`Фиксирую исполнителя ${company.company_name} и завершаю ТЗ`);
+    try {
+      const data = await request("/tz/complete", {
+        method: "POST",
+        body: JSON.stringify({
+          document: currentTz,
+          company_id: company.company_id,
+          additional_product_ids: selectedAdditionalServices,
+        }),
+      });
+      setCurrentTz(data.document);
+      setValidation(data.validation);
+      setIsNewDraft(false);
+      clearLocalDraft();
+      setStatus(`ТЗ завершено: исполнитель ${company.company_name}`);
+      loadTzList();
+    } catch (error) {
+      setStatus(`Не удалось завершить ТЗ: ${error.message}`);
+    } finally {
+      setTzBusy(false);
+    }
+  }
+
   function buildAssistantContext() {
     return {
       active_tab: activeTab,
       query,
-      tz: currentTz
-        ? { id: currentTz.id, template_name: currentTz.template_name, ready_score: currentTz.ready_score,
-            sections_filled: currentTz.sections.filter((s) => s.content.trim()).length, sections_total: currentTz.sections.length }
-        : null,
+      current_document: currentTz,
       validation_issues: validation?.issues || [],
       estimate_summary: estimate?.summary || null,
     };
@@ -600,9 +818,9 @@ export default function App() {
 
   function localAssistantReply(message) {
     const value = message.toLowerCase();
-    if (value.includes("дополн") || value.includes("заполн")) return "Нажмите «Дополнить с ИИ» — заполню пустые разделы.";
-    if (value.includes("сгенерир") || value.includes("полност")) return "Нажмите «Сгенерировать полностью» — соберу всё ТЗ.";
-    if (value.includes("срок") || value.includes("роадмап") || value.includes("подряд")) return "Откройте «Роадмап» — сроки и этапы по каждому подрядчику.";
+    if (value.includes("дополн") || value.includes("заполн")) return "Переношу данные диалога в поля и дополняю пустые разделы ТЗ.";
+    if (value.includes("сгенерир") || value.includes("полност") || value.includes("собери тз")) return "Собираю ТЗ по заполненным полям и истории диалога.";
+    if (value.includes("срок") || value.includes("роадмап") || value.includes("подряд")) return "Заполните этапы и нажмите «Рассчитать диаграмму Ганта» внизу конструктора.";
     if (value.includes("шаблон")) return "Шаблон можно сменить в конструкторе (выпадающий список).";
     return "Могу дополнить/сгенерировать ТЗ, сменить шаблон и оценить сроки подрядчиков.";
   }
@@ -614,39 +832,92 @@ export default function App() {
     setChatInput("");
     setIsAssistantLoading(true);
     try {
-      if (currentTz) {
+      if (currentTz && !isNewDraft) {
         // Чат привязан к документу: история хранится на сервере, ИИ может предлагать правки полей.
         const data = await request(`/tz/${currentTz.id}/chat`, {
           method: "POST",
           body: JSON.stringify({ message, context: { active_tab: activeTab } }),
         });
-        setChatMessages((current) => [...current, normalizeChatMessage(data.message)]);
-        if (data.validation) {
-          setValidation(data.validation);
-          setCurrentTz((cur) => (cur ? { ...cur, ready_score: data.validation.ready_score } : cur));
+        let nextMessage = { ...normalizeChatMessage(data.message), discovery: data.discovery || null };
+        setAssistantStatus({ enabled: data.provider === "deepseek" && !data.fallback, provider: data.provider, model: data.model || "local" });
+        let nextValidation = data.validation;
+        if (nextMessage.field_updates?.length) {
+          const applied = await request(`/tz/${currentTz.id}/chat/apply`, {
+            method: "POST", body: JSON.stringify({ updates: nextMessage.field_updates }),
+          });
+          setCurrentTz(applied.document);
+          nextValidation = applied.validation;
+          const appliedKeys = new Set((applied.applied || []).map((item) => `${item.target}:${item.key}`));
+          nextMessage = { ...nextMessage, field_updates: nextMessage.field_updates.map((item) => ({
+            ...item, applied: appliedKeys.has(`${item.target}:${item.key}`),
+          })) };
         }
+        const generationMode = requestedGenerationMode(message);
+        if (generationMode) {
+          const generated = await request(`/tz/${currentTz.id}/generate`, {
+            method: "POST",
+            body: JSON.stringify({ mode: generationMode, instruction: `Собери ТЗ по диалогу: ${message}` }),
+          });
+          setCurrentTz(generated.document);
+          nextValidation = generated.validation;
+          nextMessage.text = `${nextMessage.text} Поля и разделы ТЗ обновлены по диалогу.`;
+        }
+        setChatMessages((current) => [...current, nextMessage]);
+        setValidation(nextValidation);
+        setCurrentTz((current) => current && nextValidation ? { ...current, ready_score: nextValidation.ready_score } : current);
       } else {
-        const response = await fetch(AI_CHAT_ENDPOINT, {
+        const response = await fetch(currentTz ? `${API_BASE}/assistant/draft-chat` : AI_CHAT_ENDPOINT, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             message,
             context: buildAssistantContext(),
             history: chatMessages.slice(-8).map((m) => ({ role: m.role, text: m.text })),
+            ...(currentTz ? { document: currentTz } : {}),
           }),
         });
         if (!response.ok) throw new Error("unavailable");
         const data = await response.json();
-        setChatMessages((current) => [...current, normalizeChatMessage({
+        setAssistantStatus({ enabled: data.provider === "deepseek" && !data.fallback, provider: data.provider, model: data.model || "local" });
+        let nextMessage = normalizeChatMessage({
           id: `a-${Date.now()}`,
           role: "assistant",
           text: data.reply || localAssistantReply(message),
           suggestions: data.suggestions,
           field_updates: data.field_updates,
           warnings: data.warnings,
-        })]);
+          provider: data.provider,
+          fallback: data.fallback,
+          discovery: data.discovery,
+        });
+        if (currentTz) {
+          const appliedUpdates = (data.field_updates || []).map((item) => ({ ...item, applied: true }));
+          let nextDocument = applyUpdatesToDocument(currentTz, appliedUpdates);
+          const generationMode = requestedGenerationMode(message);
+          if (generationMode) {
+            const dialogContext = [...chatMessages.filter((item) => item.role === "user").slice(-8).map((item) => item.text), message].join("\n");
+            const generated = await request("/tz/preview/generate", {
+              method: "POST",
+              body: JSON.stringify({ document: nextDocument, mode: generationMode, instruction: `Контекст диалога:\n${dialogContext}` }),
+            });
+            nextDocument = generated.document;
+            setValidation(generated.validation);
+            nextMessage.text = `${nextMessage.text} Поля и разделы черновика уже обновлены.`;
+          } else {
+            const checked = await request("/tz/preview/validate", {
+              method: "POST", body: JSON.stringify(nextDocument),
+            });
+            setValidation(checked);
+            nextDocument.ready_score = checked.ready_score;
+          }
+          setCurrentTz(nextDocument);
+          nextMessage.field_updates = appliedUpdates;
+          if (appliedUpdates.length) setStatus(`ИИ автоматически заполнил полей: ${appliedUpdates.length}`);
+        }
+        setChatMessages((current) => [...current, nextMessage]);
       }
     } catch {
+      setAssistantStatus({ enabled: false, provider: "rules", model: "local" });
       setChatMessages((current) => [...current, { id: `a-${Date.now()}`, role: "assistant", text: localAssistantReply(message) }]);
     } finally {
       setIsAssistantLoading(false);
@@ -657,6 +928,17 @@ export default function App() {
     if (!currentTz || !updates?.length) return;
     setIsAssistantLoading(true);
     try {
+      if (isNewDraft) {
+        setCurrentTz((current) => applyUpdatesToDocument(current, updates));
+        const appliedKeys = new Set(updates.map((u) => `${u.target}:${u.key}`));
+        setChatMessages((current) => current.map((m) => ({
+          ...m,
+          field_updates: (m.field_updates || []).map((u) =>
+            appliedKeys.has(`${u.target}:${u.key}`) ? { ...u, applied: true } : u),
+        })));
+        setStatus(`Перенесено в черновик: ${updates.length}`);
+        return;
+      }
       const data = await request(`/tz/${currentTz.id}/chat/apply`, {
         method: "POST",
         body: JSON.stringify({ updates }),
@@ -679,33 +961,26 @@ export default function App() {
   }
 
   const tabs = [
-    ["search", "Поиск"],
     ["constructor", "Конструктор ТЗ"],
     ["mytz", "Мои ТЗ"],
-    ["roadmap", "Роадмап ТЗ"],
     ["analytics", "Аналитика"],
   ];
   const titles = {
-    search: "AI-агент поиска",
     constructor: "Конструктор ТЗ",
     mytz: "Мои ТЗ",
-    roadmap: "Сроки и роадмап подрядчиков",
     analytics: "Контур управления",
   };
   const tabIcons = {
-    search: Search,
     constructor: FileText,
     mytz: History,
-    roadmap: Clock3,
     analytics: LayoutDashboard,
   };
 
   return (
     <div className="platform-shell">
       <header className="platform-header">
-        <button className="platform-brand" type="button" onClick={() => setActiveTab("search")}>
-          <span className="platform-brand-mark"><span>П</span></span>
-          <span><strong>ПРОСТОР</strong><small>единое окно заказчика</small></span>
+        <button className="platform-brand" type="button" onClick={() => setActiveTab("constructor")}>
+          <strong>ПРОСТОР 2.0</strong>
         </button>
         <nav className="platform-nav" aria-label="Основная навигация">
           {tabs.map(([key, label]) => {
@@ -739,21 +1014,6 @@ export default function App() {
           </div>
         </header>
 
-        {activeTab === "search" && (
-          <SearchView
-            query={query}
-            setQuery={setQuery}
-            runSearch={runSearch}
-            response={searchResponse}
-            results={results}
-            selectedResult={selectedResult}
-            setSelectedResult={setSelectedResult}
-            templates={templates}
-            templateDetails={templateDetails}
-            onCreateTz={createTzFromSearch}
-          />
-        )}
-
         {activeTab === "constructor" && (
           <ConstructorView
             templates={templates}
@@ -763,6 +1023,7 @@ export default function App() {
             newTz={newTz}
             setNewTz={setNewTz}
             createTz={createTz}
+            isNewDraft={isNewDraft}
             tzBusy={tzBusy}
             tzInstruction={tzInstruction}
             setTzInstruction={setTzInstruction}
@@ -772,22 +1033,23 @@ export default function App() {
             onExport={exportTz}
             onEstimate={estimateForCurrentTz}
             onValidate={validateCurrentTz}
-            onNew={() => { setCurrentTz(null); setEstimate(null); setSelectedAdditionalServices([]); }}
+            onNew={() => startNewDraft()}
             updateTzField={updateTzField}
             updateTzInput={updateTzInput}
             updateTzReq={updateTzReq}
             updateSection={updateSection}
+            onAddSection={addCustomSection}
+            onRemoveSection={removeCustomSection}
+            estimate={estimate}
+            selectedAdditionalServices={selectedAdditionalServices}
+            onToggleAdditional={toggleAdditionalService}
+            onSelectContractor={selectContractorAndComplete}
           />
         )}
 
         {activeTab === "mytz" && (
           <MyTzView documents={tzList} onOpen={openTz} onExport={exportTz} onDelete={deleteTz}
-            onRefresh={loadTzList} onNew={() => { setCurrentTz(null); setEstimate(null); setSelectedAdditionalServices([]); setActiveTab("constructor"); }} />
-        )}
-
-        {activeTab === "roadmap" && (
-          <RoadmapView estimate={estimate} currentTz={currentTz} onEstimateTz={estimateForCurrentTz}
-            selectedAdditionalServices={selectedAdditionalServices} onToggleAdditional={toggleAdditionalService} />
+            onRefresh={loadTzList} onNew={() => startNewDraft()} onSaveFeedback={saveTzFeedback} />
         )}
 
         {activeTab === "analytics" && <AnalyticsView analytics={analytics} contractorAnalytics={contractorAnalytics} />}
@@ -806,6 +1068,7 @@ export default function App() {
         onAugment={() => generateTz("augment")}
         onFull={() => generateTz("full")}
         status={assistantStatus}
+        onOpenTz={openTz}
       />
       </main>
       <footer className="platform-footer">
@@ -902,8 +1165,19 @@ function SearchView({ query, setQuery, runSearch, response, results, selectedRes
 
 function ConstructorView(props) {
   const { currentTz } = props;
-  if (!currentTz) return <NewTzForm {...props} />;
+  if (!currentTz) return <section className="panel"><EmptyState text="Загружаю единый конструктор ТЗ…" /></section>;
   return <TzEditor {...props} />;
+}
+
+function ReadyScore({ value, className }) {
+  const label = value >= 80 ? "Готово к выпуску" : value >= 50 ? "Нужно уточнить детали" : "Заполните ключевые поля";
+  return (
+    <div className={`ready-score-card ${className || ""}`}>
+      <div><span>Заполненность ТЗ</span><strong>{value}%</strong></div>
+      <i><em style={{ width: `${value}%` }} /></i>
+      <small>{label}</small>
+    </div>
+  );
 }
 
 function NewTzForm({ templates, templateDetails, newTz, setNewTz, createTz, tzBusy }) {
@@ -965,12 +1239,13 @@ function NewTzForm({ templates, templateDetails, newTz, setNewTz, createTz, tzBu
 
 function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstruction, onSwitchTemplate,
   onGenerate, onSave, onExport, onEstimate, onValidate, onNew, updateTzField, updateTzInput, updateTzReq, updateSection,
-  validation, templateDetails }) {
+  validation, templateDetails, isNewDraft, createTz, estimate, selectedAdditionalServices, onToggleAdditional,
+  onSelectContractor, onAddSection, onRemoveSection }) {
   const tz = currentTz;
   const template = templateDetails[tz.template_key];
   const [showExample, setShowExample] = useState(false);
   const input = tz.input_data || {};
-  const liveReady = computeLiveReady(tz, template);
+  const liveReady = tz.status === "ready" && tz.requisites?.selected_contractor_id ? 100 : computeLiveReady(tz, template);
   const readyClass = liveReady >= 70 ? "good" : liveReady >= 40 ? "warn" : "bad";
   const templateValues = {
     ...tz.requisites,
@@ -985,24 +1260,27 @@ function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstructio
     else updateTzReq(key, value);
   };
   return (
-    <div className="grid draft-grid">
-      <section className="panel">
+    <div className="constructor-dashboard">
+      <section className="panel constructor-main" onBlurCapture={(event) => {
+        const target = event.target;
+        if (target.matches?.("input, textarea, select") && !target.closest(".gantt-zoom")) onValidate({ silent: true });
+      }}>
         <div className="panel-heading">
           <div>
-            <span className="eyebrow">ТЗ {tz.id}</span>
+            <span className="eyebrow">{isNewDraft ? "Единый конструктор · ещё не сохранено" : `ТЗ ${tz.id}`}</span>
             <h3>{tz.template_name}</h3>
+            <p className="muted">Все поля, разделы, этапы и расчёт подрядчиков находятся на одной странице.</p>
           </div>
           <div className="actions">
-            <button onClick={() => onSave()} disabled={tzBusy}>Сохранить</button>
-            <button className="secondary" onClick={onValidate} disabled={tzBusy}>Проверить</button>
+            {!isNewDraft && <button onClick={() => onSave()} disabled={tzBusy}>Сохранить</button>}
+            <span className="auto-validation-badge">✓ Автопроверка включена</span>
             <button className="example-button" onClick={() => setShowExample(true)}>? Пример</button>
             <details className="action-menu">
               <summary>Действия</summary>
               <div>
                 <button onClick={() => onGenerate("augment")} disabled={tzBusy}>Дополнить с DeepSeek</button>
                 <button onClick={() => onGenerate("full")} disabled={tzBusy}>Пересобрать полностью</button>
-                <button onClick={() => onExport(tz.id, tz.title)}>Экспорт DOCX</button>
-                <button onClick={onEstimate}>Сроки и стоимость</button>
+                {!isNewDraft && <button onClick={() => onExport(tz.id, tz.title)}>Экспорт DOCX</button>}
                 <button onClick={onNew}>Новое ТЗ</button>
               </div>
             </details>
@@ -1039,7 +1317,27 @@ function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstructio
             onChange={(v) => updateTzInput("subcontract_share_percent", numOrNull(v))} />
         )}
 
-        <StageEditor stages={tz.requisites?.stages || []} onChange={(stages) => updateTzReq("stages", stages)} />
+        <ServiceEditor
+          services={tz.requisites?.services || []}
+          onChange={(services, removedName) => {
+            updateTzReq("services", services);
+            if (removedName) updateTzReq("removed_auto_services", [
+              ...(tz.requisites?.removed_auto_services || []), removedName,
+            ]);
+          }}
+        />
+        <StageEditor
+          stages={tz.requisites?.stages || []}
+          source={tz.requisites?.plan_source}
+          onChange={(stages) => updateTzReq("stages", stages)}
+          onGenerate={() => onGenerate("augment", null, tzInstruction, true)}
+          disabled={tzBusy}
+        />
+        <ScheduleConstraintEditor
+          stages={tz.requisites?.stages || []}
+          constraints={tz.requisites?.schedule_constraints || []}
+          onChange={(constraints) => updateTzReq("schedule_constraints", constraints)}
+        />
 
         <details className="editor-block">
           <summary>Указание для DeepSeek</summary>
@@ -1053,13 +1351,27 @@ function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstructio
           {tz.sections.map((section) => (
             <SectionEditor key={section.key} section={section} disabled={tzBusy}
               onChange={(v) => updateSection(section.key, v)}
-              onGenerate={() => onGenerate("augment", [section.key])} />
+              onGenerate={() => onGenerate("augment", [section.key])}
+              onRemove={section.key.startsWith("custom-") ? () => onRemoveSection(section.key) : null} />
           ))}
+          <CustomSectionForm onAdd={onAddSection} disabled={tzBusy} />
         </div>
+
+        <ConstructorEstimate
+          estimate={estimate}
+          currentTz={tz}
+          onEstimate={() => onEstimate(selectedAdditionalServices)}
+          selectedAdditionalServices={selectedAdditionalServices}
+          onToggleAdditional={onToggleAdditional}
+          isNewDraft={isNewDraft}
+          validation={validation}
+          onSelectContractor={onSelectContractor}
+          busy={tzBusy}
+        />
       </section>
 
       <aside className="panel inspector">
-        <OilGauge value={liveReady} className={readyClass} />
+        <ReadyScore value={liveReady} className={readyClass} />
         <InfoGroup title="Статус"><div className="chips"><span>{statusLabels[tz.status] || tz.status}</span></div></InfoGroup>
         <InfoGroup title="Разделы">
           <div className="chips">
@@ -1076,23 +1388,69 @@ function TzEditor({ currentTz, templates, tzBusy, tzInstruction, setTzInstructio
   );
 }
 
-function SectionEditor({ section, onChange, onGenerate, disabled }) {
+function SectionEditor({ section, onChange, onGenerate, onRemove, disabled }) {
   return (
-    <details className="section-card" open={!section.content.trim()}>
-      <summary className="section-head">
+    <article className="section-card section-always-open">
+      <header className="section-head">
         <h5>{section.title}</h5>
         <span className={`source-badge ${section.source}`}>{sourceLabels[section.source] || section.source}</span>
-      </summary>
+      </header>
       <textarea value={section.content} onChange={(e) => onChange(e.target.value)} rows={6}
         placeholder="Текст раздела — заполните вручную или используйте DeepSeek." />
       <div className="section-actions">
+        {onRemove && <button type="button" className="link-button danger-link" onClick={onRemove} disabled={disabled}>Удалить</button>}
         <button type="button" className="secondary" onClick={onGenerate} disabled={disabled}>Заполнить раздел</button>
+      </div>
+    </article>
+  );
+}
+
+function CustomSectionForm({ onAdd, disabled }) {
+  const [title, setTitle] = useState("");
+  const submit = (event) => {
+    event.preventDefault();
+    if (!title.trim()) return;
+    onAdd(title);
+    setTitle("");
+  };
+  return (
+    <form className="custom-section-form" onSubmit={submit}>
+      <div><strong>Добавить свой раздел</strong><small>Название станет отдельным полем и будет передано ИИ-агенту.</small></div>
+      <input value={title} onChange={(event) => setTitle(event.target.value)}
+        placeholder="Например: Требования к информационной безопасности" maxLength={160} />
+      <button type="submit" disabled={disabled || !title.trim()}>Добавить поле</button>
+    </form>
+  );
+}
+
+function ServiceEditor({ services, onChange }) {
+  const normalized = services.map((item) => (typeof item === "string" ? { name: item, source: "manual" } : item));
+  const update = (index, name) => onChange(normalized.map((item, i) => (i === index ? { ...item, name } : item)));
+  return (
+    <details className="editor-block" open>
+      <summary>Услуги ({normalized.length})</summary>
+      <p className="muted">Обязательные услуги добавляются по правилам ТЗ и данным системы. Любую услугу можно изменить или удалить; ИИ учитывает этот список при составлении этапов.</p>
+      <div className="stage-editor service-editor">
+        {normalized.map((item, index) => (
+          <div key={`${index}-${item.name}`}>
+            <span>{index + 1}</span>
+            <input value={item.name || ""} onChange={(event) => update(index, event.target.value)} />
+            {item.mandatory && <small title={item.reason || "Обязательная услуга"}>обязательная</small>}
+            <button type="button" className="icon-button" onClick={() => onChange(
+              normalized.filter((_, i) => i !== index),
+              item.source !== "manual" ? item.name : null,
+            )}>×</button>
+          </div>
+        ))}
+        <button type="button" className="secondary" onClick={() => onChange([
+          ...normalized, { name: "Новая услуга", mandatory: false, source: "manual", reason: "" },
+        ])}>Добавить услугу</button>
       </div>
     </details>
   );
 }
 
-function StageEditor({ stages, onChange }) {
+function StageEditor({ stages, onChange, onGenerate, source, disabled }) {
   const update = (index, value) => onChange(stages.map((stage, i) => (i === index ? value : stage)));
   return (
     <details className="editor-block">
@@ -1105,9 +1463,121 @@ function StageEditor({ stages, onChange }) {
             <button type="button" className="icon-button" onClick={() => onChange(stages.filter((_, i) => i !== index))}>×</button>
           </div>
         ))}
-        <button type="button" className="secondary" onClick={() => onChange([...stages, "Новый этап"])}>Добавить этап</button>
+        <div className="actions">
+          <button type="button" onClick={onGenerate} disabled={disabled}>Сформировать этапы ИИ</button>
+          <button type="button" className="secondary" onClick={() => onChange([...stages, "Новый этап"])}>Добавить этап</button>
+          {source && <small className="muted">Источник плана: {source === "ai" ? "ИИ" : "правила и БД"}</small>}
+        </div>
       </div>
     </details>
+  );
+}
+
+function ScheduleConstraintEditor({ stages, constraints, onChange }) {
+  const update = (index, patch) => onChange(constraints.map((item, i) => (i === index ? { ...item, ...patch } : item)));
+  return (
+    <section className="editor-block constraint-editor">
+      <div className="editor-block-title">
+        <span>Дополнительные условия и приостановления</span>
+        <small>Попадут на диаграмму отдельными полосами и повлияют на срок/стоимость.</small>
+      </div>
+      <div className="constraint-list">
+        {constraints.map((item, index) => (
+          <div className="constraint-row" key={index}>
+            <label><span>После этапа</span><select value={item.after_stage ?? 0} onChange={(e) => update(index, { after_stage: Number(e.target.value) })}>
+              <option value={0}>До начала работ</option>
+              {stages.map((stage, stageIndex) => <option key={stageIndex} value={stageIndex + 1}>{stageIndex + 1}. {stage}</option>)}
+            </select></label>
+            <TextInput label="Причина паузы" value={item.reason || ""} onChange={(value) => update(index, { reason: value })} />
+            <TextInput label="Дней" type="number" value={item.days ?? ""} onChange={(value) => update(index, { days: Number(value) })} />
+            <TextInput label="Оплачиваемый простой, %" type="number" value={item.billable_percent ?? 0}
+              onChange={(value) => update(index, { billable_percent: Number(value) })} />
+            <button type="button" className="icon-button" onClick={() => onChange(constraints.filter((_, i) => i !== index))}>×</button>
+          </div>
+        ))}
+        <button type="button" className="secondary" onClick={() => onChange([...constraints, {
+          after_stage: stages.length ? 1 : 0, reason: "Ожидание дополнительных исходных данных", days: 5, billable_percent: 0,
+        }])}>Добавить условие</button>
+      </div>
+    </section>
+  );
+}
+
+function ConstructorEstimate({ estimate, currentTz, onEstimate, selectedAdditionalServices,
+  onToggleAdditional, isNewDraft, validation, onSelectContractor, busy }) {
+  const cheapest = [...(estimate?.companies || [])].sort((a, b) => a.cost_without_vat - b.cost_without_vat).slice(0, 3);
+  const selectedContractorId = currentTz.requisites?.selected_contractor_id;
+  const canComplete = Boolean(validation?.valid && validation.ready_score === 100);
+  return (
+    <section className="constructor-estimate">
+      <div className="estimate-callout">
+        <div><span className="eyebrow">РАСЧЁТ ПО ЗАПОЛНЕННОМУ ТЗ</span><h4>Подрядчики, стоимость и диаграммы Ганта</h4>
+          <p>Расчёт использует текущие поля, этапы и дополнительные условия — сохранять ТЗ заранее не нужно.</p></div>
+        <button type="button" onClick={() => onEstimate(selectedAdditionalServices)} disabled={busy}>Рассчитать диаграмму Ганта</button>
+      </div>
+
+      {estimate && <>
+        <div className="traffic-board">
+          <div className="traffic-heading"><span className="eyebrow">СВЕТОФОР ЦЕНЫ</span><h4>Топ-3 по минимальной стоимости</h4></div>
+          {cheapest.length ? <div className="traffic-grid">{cheapest.map((company, index) => (
+            <article className={`traffic-card place-${index + 1}`} key={company.company_id}>
+              <i /><span>№ {index + 1}</span><strong>{company.company_name}</strong>
+              <b>{formatMoney(company.cost_without_vat)}</b>
+              <small>рейтинг {company.rating ?? "—"} · {company.estimated_days} дней</small>
+            </article>
+          ))}</div> : <p className="contractor-empty">Нет подрядчиков, подтвердивших все условия текущего ТЗ. Причины исключения указаны ниже.</p>}
+        </div>
+
+        <div className="grid analytics-grid estimate-kpis">
+          <Metric label="Подходящих подрядчиков" value={estimate.summary.company_count} />
+          <Metric label="Минимальная стоимость" value={formatMoney(estimate.summary.lowest_cost_without_vat)} />
+          <Metric label="Средняя стоимость" value={formatMoney(estimate.summary.average_cost_without_vat)} />
+          <Metric label="Минимальный срок" value={`${estimate.summary.fastest_days} дн`} />
+        </div>
+
+        <ExcludedContractors contractors={estimate.excluded_contractors} />
+
+        <div className="estimate-method-grid">
+          <section>
+            <span className="eyebrow">КРИТЕРИИ ПОДБОРА</span>
+            <h5>Почему подрядчик попал в расчёт</h5>
+            <ul>{(estimate.summary.selection_criteria || []).map((item) => <li key={item}>{item}</li>)}</ul>
+          </section>
+          <section>
+            <span className="eyebrow">ФОРМУЛА ЦЕНЫ</span>
+            <h5>Что изменяет стоимость</h5>
+            <ul>{(estimate.summary.pricing_criteria || []).map((item) => <li key={item}>{item}</li>)}</ul>
+            <small>Локация расчёта: <b>{estimate.summary.location || "не указана"}</b></small>
+          </section>
+        </div>
+
+        {estimate.available_additional_services?.length > 0 && <section className="additional-services">
+          <div className="editor-block-title"><span>Дополнительные услуги</span><small>Добавляются к стоимости подходящих подрядчиков.</small></div>
+          <div className="additional-service-grid">{estimate.available_additional_services.map((service) => (
+            <label key={service.product_id} className={selectedAdditionalServices.includes(service.product_id) ? "selected" : ""}>
+              <input type="checkbox" checked={selectedAdditionalServices.includes(service.product_id)} onChange={() => onToggleAdditional(service.product_id)} />
+              <span><strong>{service.name}</strong><small>{service.common_company_count} компаний · от {formatMoney(service.min_cost_without_vat)}</small></span>
+            </label>
+          ))}</div>
+        </section>}
+
+        <div className="roadmap-list all-contractors">
+          {estimate.companies.map((company, index) => <ContractorRoadmap key={company.company_id} company={company} rank={index + 1}
+            selected={selectedContractorId === company.company_id} canSelect={canComplete}
+            onSelect={() => onSelectContractor(company)} busy={busy} />)}
+        </div>
+        <p className="estimate-disclaimer">{estimate.summary.cost_disclaimer}</p>
+      </>}
+
+      <div className={`finalize-bar ${currentTz.status === "ready" ? "completed" : ""}`}>
+        <div><strong>{currentTz.status === "ready" ? "ТЗ завершено на 100%" : estimate ? "Финальный шаг — выбор исполнителя" : "Сначала рассчитайте диаграммы Ганта"}</strong>
+          <span>{currentTz.status === "ready"
+            ? `Исполнитель: ${currentTz.executor_name} · договор ${currentTz.contract_name || "не указан"}`
+            : !canComplete && estimate
+              ? `Перед выбором подрядчика устраните замечания: текущая готовность ${validation?.ready_score || 0}%`
+              : "Выберите подходящего подрядчика в его карточке — после этого ТЗ сохранится и перейдёт в статус «готово»."}</span></div>
+      </div>
+    </section>
   );
 }
 
@@ -1135,7 +1605,7 @@ function ValidationPanel({ validation }) {
   );
 }
 
-function MyTzView({ documents, onOpen, onExport, onDelete, onRefresh, onNew }) {
+function MyTzView({ documents, onOpen, onExport, onDelete, onRefresh, onNew, onSaveFeedback }) {
   return (
     <section className="panel">
       <div className="panel-heading">
@@ -1172,6 +1642,7 @@ function MyTzView({ documents, onOpen, onExport, onDelete, onRefresh, onNew }) {
                   <button className="secondary" onClick={() => onExport(doc.id, doc.title)}>DOCX</button>
                   <button className="secondary" onClick={() => onDelete(doc.id)}>Удалить</button>
                 </div>
+                {doc.status === "ready" && <TzFeedbackForm document={doc} onSave={onSaveFeedback} />}
               </article>
             );
           })}
@@ -1235,6 +1706,7 @@ function RoadmapView({ estimate, currentTz, onEstimateTz, selectedAdditionalServ
                 <ContractorRoadmap key={company.company_id} company={company} rank={index + 1} />
               ))}
             </div>
+            <ExcludedContractors contractors={estimate.excluded_contractors} />
           </>
         )}
       </section>
@@ -1242,14 +1714,111 @@ function RoadmapView({ estimate, currentTz, onEstimateTz, selectedAdditionalServ
   );
 }
 
-function ContractorRoadmap({ company, rank }) {
+function TzFeedbackForm({ document, onSave }) {
+  const blank = { rating: null, comment: "" };
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+  const [aiInitiallyGenerated, setAiInitiallyGenerated] = useState(Boolean(document.ai_initially_generated));
+  const [feedback, setFeedback] = useState({
+    contractor: { ...blank, ...(document.feedback?.contractor || {}) },
+    ai_tz: { ...blank, ...(document.feedback?.ai_tz || {}) },
+    ai_chat: { ...blank, ...(document.feedback?.ai_chat || {}) },
+  });
+  const change = (kind, patch) => {
+    setSaved(false);
+    setFeedback((current) => ({ ...current, [kind]: { ...current[kind], ...patch } }));
+  };
+  const submit = async (event) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await onSave(document.id, { ai_initially_generated: aiInitiallyGenerated, feedback });
+      setSaved(true);
+    } catch (saveError) {
+      setError(saveError.message || "Не удалось сохранить оценки");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const hasRating = feedback.contractor.rating || feedback.ai_tz.rating || feedback.ai_chat.rating;
+  return (
+    <div className="tz-feedback">
+      <button type="button" className="secondary feedback-toggle" onClick={() => setOpen((value) => !value)}>
+        {open ? "Скрыть оценки" : hasRating ? "Изменить оценки" : "Оценить выполнение и ИИ"}
+      </button>
+      {open && <form onSubmit={submit}>
+        <h4>Оценка завершённого ТЗ</h4>
+        <EvaluationField title={`Подрядчик${document.executor_name ? `: ${document.executor_name}` : ""}`}
+          value={feedback.contractor} onChange={(patch) => change("contractor", patch)} />
+        <label className="ai-origin-check"><input type="checkbox" checked={aiInitiallyGenerated}
+          onChange={(event) => { setAiInitiallyGenerated(event.target.checked); setSaved(false); }} />
+          <span><strong>Первоначальный вариант ТЗ заполнялся ИИ</strong><small>После генерации заказчик проверял и редактировал документ.</small></span>
+        </label>
+        {aiInitiallyGenerated && <EvaluationField title="ИИ при создании ТЗ" value={feedback.ai_tz}
+          onChange={(patch) => change("ai_tz", patch)} />}
+        <EvaluationField title="ИИ-агент в чате" value={feedback.ai_chat}
+          onChange={(patch) => change("ai_chat", patch)} />
+        <div className="feedback-submit"><button type="submit" disabled={busy || !hasRating}>{busy ? "Сохраняю…" : "Сохранить оценки"}</button>
+          {saved && <span>✓ Сохранено</span>}{error && <span className="feedback-error">{error}</span>}</div>
+      </form>}
+    </div>
+  );
+}
+
+function EvaluationField({ title, value, onChange }) {
+  return (
+    <fieldset className="evaluation-field">
+      <legend>{title}</legend>
+      <div className="star-picker" aria-label={`${title}: оценка по пятибалльной шкале`}>
+        {[1, 2, 3, 4, 5].map((rating) => <button key={rating} type="button"
+          className={(value.rating || 0) >= rating ? "selected" : ""}
+          onClick={() => onChange({ rating })} aria-label={`${rating} из 5`}>★</button>)}
+        <span>{value.rating ? `${value.rating} из 5` : "Не оценено"}</span>
+      </div>
+      <textarea rows={2} value={value.comment || ""} maxLength={4000}
+        onChange={(event) => onChange({ comment: event.target.value })} placeholder="Комментарий" />
+    </fieldset>
+  );
+}
+
+function ExcludedContractors({ contractors = [] }) {
+  if (!contractors.length) return null;
+  return (
+    <details className="excluded-contractors">
+      <summary>Не прошли проверку условий: {contractors.length}</summary>
+      <div>{contractors.map((company) => (
+        <article key={company.company_id}>
+          <strong>{company.company_name}</strong>
+          <ul>{company.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+        </article>
+      ))}</div>
+    </details>
+  );
+}
+
+function ContractorRoadmap({ company, rank, selected = false, canSelect = false, onSelect, busy = false }) {
+  const [zoom, setZoom] = useState(1);
+  const totalDays = Math.max(company.estimated_days || 1, 1);
+  const datedStages = company.stages.filter((stage) => stage.start_date && stage.end_date);
+  const timelineStart = datedStages[0]?.start_date;
+  const timelineEnd = datedStages[datedStages.length - 1]?.end_date;
+  const ticks = Array.from({ length: 5 }, (_, index) => {
+    if (!timelineStart || !timelineEnd) return { left: index * 25, label: `${Math.round(index * totalDays / 4)} дн` };
+    const start = new Date(`${timelineStart}T00:00:00Z`);
+    const end = new Date(`${timelineEnd}T00:00:00Z`);
+    const current = new Date(start.getTime() + (end.getTime() - start.getTime()) * index / 4);
+    return { left: index * 25, label: current.toLocaleDateString("ru-RU", { day: "2-digit", month: "short", year: index === 0 || index === 4 ? "numeric" : undefined, timeZone: "UTC" }) };
+  });
   return (
     <article className="contractor-card">
       <div className="contractor-head">
         <div>
           <strong>{rank}. {company.company_name}</strong>
+          <span className="contractor-rating"><b>★ {company.rating ?? "—"}</b><small> рейтинг · соответствие {company.suitability_score || "—"}/100</small></span>
           <small>
-            рейтинг {company.rating ?? "—"}
             {company.contract_number ? ` · договор ${company.contract_number}` : ""}
             {company.variants > 1 ? ` · вариантов РС: ${company.variants}` : ""}
           </small>
@@ -1261,23 +1830,50 @@ function ContractorRoadmap({ company, rank }) {
         </div>
       </div>
 
-      <div className="roadmap-track">
+      <div className="gantt-legend">
+        <span><i className="work" /> Этап работ</span><span><i className="pause" /> Приостановка / ожидание</span>
+        <small>{timelineStart && timelineEnd ? `${timelineStart} — ${timelineEnd}` : `${totalDays} дней`}</small>
+        <div className="gantt-zoom" aria-label="Масштаб диаграммы">
+          <button type="button" onClick={() => setZoom((value) => Math.max(0.8, +(value - 0.2).toFixed(1)))} disabled={zoom <= 0.8} aria-label="Уменьшить масштаб">−</button>
+          <input type="range" min="80" max="240" step="20" value={Math.round(zoom * 100)} onChange={(event) => setZoom(Number(event.target.value) / 100)} aria-label="Масштаб диаграммы Ганта" />
+          <output>{Math.round(zoom * 100)}%</output>
+          <button type="button" onClick={() => setZoom((value) => Math.min(2.4, +(value + 0.2).toFixed(1)))} disabled={zoom >= 2.4} aria-label="Увеличить масштаб">+</button>
+          <button type="button" className="gantt-reset" onClick={() => setZoom(1)}>Сбросить</button>
+        </div>
+      </div>
+      <div className="gantt-scroll"><div className="gantt-chart" style={{ width: `${zoom * 100}%` }}>
+        <div className="gantt-axis-label">Этап</div>
+        <div className="gantt-axis">{ticks.map((tick) => <span key={tick.left} style={{ left: `${tick.left}%` }}>{tick.label}</span>)}</div>
         {company.stages.map((stage, i) => (
-          <div key={stage.order} className={`roadmap-seg c${i % 5}`} style={{ width: `${stage.percent}%` }}
-            title={`${stage.name} — ${stage.days} дн${stage.start_date ? ` (${stage.start_date}…${stage.end_date})` : ""}`}>
-            <span>{stage.days}</span>
+          <div className={`gantt-row ${stage.kind === "pause" ? "pause-row" : ""}`} key={stage.order}>
+            <div className="gantt-row-label"><b>{stage.name}</b><small>{stage.days} дн. · {stage.start_date || "—"} — {stage.end_date || "—"}</small></div>
+            <div className="gantt-lane">
+              <div className={`gantt-bar ${stage.kind === "pause" ? "pause" : `c${i % 5}`}`}
+                style={{ left: `${stage.offset_days * 100 / totalDays}%`, width: `${Math.max(stage.days * 100 / totalDays, 1.2)}%` }}>
+                <span>{stage.days} дн.</span>
+                <div className="stage-tooltip"><strong>{stage.name}</strong><b>{formatMoney(stage.estimated_cost_without_vat)}</b><small>{stage.days} дней{stage.kind === "pause" ? ` · оплачиваемый простой ${stage.billable_percent || 0}%` : ""}</small></div>
+              </div>
+            </div>
           </div>
         ))}
+      </div></div>
+      <details className="contractor-method">
+        <summary>Почему подходит и как рассчитана цена</summary>
+        <div><ul>{(company.selection_reasons || []).map((reason) => <li key={reason}>{reason}</li>)}</ul>
+          <ul>{(company.cost_factors || []).map((factor) => <li key={factor.key}><b>{factor.label} ×{factor.multiplier}</b><span>{factor.reason}</span></li>)}</ul></div>
+      </details>
+      <div className="contractor-total">
+        <span>Полная стоимость выполнения ТЗ</span>
+        <strong>{formatMoney(company.cost_with_vat)}</strong>
+        <small>с НДС · без НДС {formatMoney(company.cost_without_vat)}</small>
       </div>
-
-      <ol className="roadmap-stages">
-        {company.stages.map((stage) => (
-          <li key={stage.order}>
-            <span className="rs-name">{stage.name}</span>
-            <span className="rs-days">{stage.days} дн · {formatMoney(stage.estimated_cost_without_vat)}</span>
-          </li>
-        ))}
-      </ol>
+      {onSelect && <div className={`contractor-selection ${selected ? "selected" : ""}`}>
+        <div><strong>{selected ? "Исполнитель выбран" : "Назначить исполнителя"}</strong>
+          <small>{canSelect || selected ? "Выбор завершит ТЗ и зафиксирует расчёт." : "Сначала доведите заполненность ТЗ до 100%."}</small></div>
+        <button type="button" onClick={onSelect} disabled={busy || selected || !canSelect}>
+          {selected ? "✓ Выбран" : "Выбрать и завершить ТЗ"}
+        </button>
+      </div>}
       {company.additional_services?.length > 0 && (
         <div className="contractor-addons">
           {company.additional_services.map((service) => (
@@ -1289,7 +1885,50 @@ function ContractorRoadmap({ company, rank }) {
   );
 }
 
-function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend, onApply, isLoading, hasTz, onAugment, onFull, status }) {
+function AssistantDiscovery({ data, onOpenTz }) {
+  if (!data) return null;
+  return (
+    <section className="assistant-discovery">
+      <header><span>Намерение</span><strong>{data.intent?.label}</strong><small>{Math.round((data.intent?.confidence || 0) * 100)}% уверенности</small></header>
+
+      {data.services?.length > 0 && <div className="discovery-group">
+        <h5>Релевантные услуги</h5>
+        {data.services.map((service, index) => <article key={service.product_id} className="discovery-service">
+          <span>#{index + 1}</span><div><b>{service.name}</b><small>{service.summary}</small>
+            <em>{service.reasons?.[0] || "Соответствует запросу"}</em></div><strong>{Math.round(service.score * 100)}%</strong>
+        </article>)}
+      </div>}
+
+      {data.similar_tz?.length > 0 && <div className="discovery-group">
+        <h5>Похожие ТЗ и кейсы</h5>
+        {data.similar_tz.slice(0, 4).map((item) => <article className="discovery-similar" key={`${item.source}-${item.id}`}>
+          <div><b>{item.title}</b><small>{item.object_name || item.source}</small><p>{item.summary}</p></div>
+          {item.is_saved && <button type="button" className="link-button" onClick={() => onOpenTz?.(item.id)}>Открыть</button>}
+        </article>)}
+      </div>}
+
+      {data.contractors?.length > 0 && <div className="discovery-group">
+        <h5>Подходящие исполнители</h5>
+        {data.contractors.slice(0, 4).map((company) => <article className="discovery-contractor" key={company.company_id}>
+          <div><b>{company.name}</b><small>{company.service_name}</small><p>{company.reasons?.[1] || company.reasons?.[0]}</p></div>
+          <strong>★ {company.rating ?? "—"}</strong>
+        </article>)}
+      </div>}
+
+      {data.filling_recommendations?.length > 0 && <div className="discovery-group">
+        <h5>Что заполнить в ТЗ</h5>
+        <ol className="discovery-recommendations">{data.filling_recommendations.map((item) => <li className={item.priority} key={item.field}><b>{item.label}</b><span>{item.recommendation}</span></li>)}</ol>
+      </div>}
+
+      {data.conditional_services?.length > 0 && <div className="discovery-group conditional">
+        <h5>Условно обязательные услуги</h5>
+        {data.conditional_services.map((item) => <article key={item.name}><span>{item.status}</span><b>{item.name}</b><small>{item.condition}</small><p>{item.reason}</p></article>)}
+      </div>}
+    </section>
+  );
+}
+
+function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend, onApply, isLoading, hasTz, onAugment, onFull, status, onOpenTz }) {
   const messageListRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -1311,9 +1950,9 @@ function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend,
   if (!isOpen) return <button className="chat-fab" onClick={onToggle}>AI-чат</button>;
 
   const quickActions = [
-    { label: "Дополнить ИИ", action: onAugment, disabled: !hasTz },
-    { label: "Сгенерировать всё", action: onFull, disabled: !hasTz },
-    { label: "Что уточнить", action: () => onSend("Что уточнить для ТЗ?") },
+    { label: "Заполнить ТЗ из чата", action: () => onSend("Заполни ТЗ по всем полям и нашей переписке"), disabled: !hasTz },
+    { label: "Собрать ТЗ целиком", action: () => onSend("Собери ТЗ целиком по контексту диалога"), disabled: !hasTz },
+    { label: "Что критично уточнить", action: () => onSend("Какого одного критичного факта не хватает для ТЗ?") },
     { label: "Про сроки", action: () => onSend("Как оценить сроки подрядчиков?") },
   ];
 
@@ -1325,7 +1964,7 @@ function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend,
           <span className="eyebrow">AI-помощник</span>
           <h3>Чат по ТЗ</h3>
           <small className={`provider-status ${status?.enabled ? "online" : "offline"}`}>
-            {status?.enabled ? `DeepSeek · ${status.model}` : "Локальные правила"}
+            {status?.enabled ? `DeepSeek · ${status.model}` : "Локальный AI · база ТЗ"}
           </small>
         </div>
         <button className="icon-button" type="button" onClick={onToggle} aria-label="Скрыть чат"><X size={17} /></button>
@@ -1345,6 +1984,7 @@ function AssistantSidebar({ isOpen, onToggle, messages, input, setInput, onSend,
         {messages.map((message) => (
           <div className={`message ${message.role}`} key={message.id}>
             <div className="message-text">{message.text}</div>
+            {message.role === "assistant" && <AssistantDiscovery data={message.discovery} onOpenTz={onOpenTz} />}
 
             {message.warnings?.length > 0 && (
               <ul className="chat-warnings">
@@ -1434,16 +2074,6 @@ function AnalyticsView({ analytics, contractorAnalytics }) {
         {[['Продукты',analytics.total_products,'+6 за квартал','blue'],['Компании',analytics.total_companies,'3 с аналогами','violet'],['Активные договоры',analytics.total_active_contracts,'83% покрытия','green'],['Исторические кейсы',analytics.total_historical_cases,'База для AI','orange']].map(([label,value,note,tone])=><section className={'analytics-kpi '+tone} key={label}><span>{label}</span><strong>{value}</strong><small>{note}</small><i /></section>)}
       </div>
 
-      <div className="analytics-main-grid">
-        <section className="panel analytics-chart"><div className="analytics-title"><div><span className="eyebrow">СПРОС</span><h4>Популярные виды работ</h4></div><small>Последние 90 дней</small></div><div className="horizontal-bars">{productBars.map((item,index)=><div key={item.label}><span><b>{index+1}</b>{item.label}<em>{item.value}%</em></span><i><em style={{width:`${item.value}%`}} /></i></div>)}</div></section>
-        <section className="panel coverage-card"><div className="analytics-title"><div><span className="eyebrow">ДАННЫЕ</span><h4>Покрытие базы ПРОСТОР</h4></div><span className="live-label"><i/>Live</span></div><div className="coverage-list">{coverageRows.map(([label,value,max])=><div key={label}><span><b>{label}</b><em>{value.toLocaleString('ru-RU')}</em></span><i><em style={{width:`${Math.min(100,value/max*100)}%`}} /></i></div>)}</div></section>
-      </div>
-
-      <div className="analytics-lower-grid">
-        <section className="panel process-card"><div className="analytics-title"><div><span className="eyebrow">ПРОЦЕСС</span><h4>Воронка подготовки ТЗ</h4></div></div><div className="process-funnel"><div><strong>462</strong><span>запроса</span></div><i>→</i><div><strong>318</strong><span>распознано</span></div><i>→</i><div><strong>48</strong><span>продуктов</span></div><i>→</i><div className="accent"><strong>20</strong><span>договоров</span></div></div><p>AI помогает сократить путь от запроса до готового ТЗ и подходящего договора.</p></section>
-        <section className="panel analytics-risks"><div className="analytics-title"><div><span className="eyebrow">КАЧЕСТВО</span><h4>Что чаще всего нужно уточнить</h4></div></div><ol>{(analytics.typical_request_errors || analytics.common_risk_patterns || []).slice(0,4).map((item,index)=><li key={item}><span>{index+1}</span><b>{item}</b></li>)}</ol></section>
-      </div>
-
       <section className="panel contractor-leaderboard">
         <div className="analytics-title"><div><span className="eyebrow">ПОДРЯДЧИКИ</span><h4>Рейтинг подрядчиков</h4></div><small>{contractorAnalytics?.summary?.total_contractors ? `${contractorAnalytics.summary.total_contractors} компаний в базе` : "По данным ПРОСТОР"}</small></div>
         {contractorRanking.length ? <div className="contractor-ranking-list">{contractorRanking.map((company,index)=>{
@@ -1452,7 +2082,15 @@ function AnalyticsView({ analytics, contractorAnalytics }) {
         })}</div> : <div className="contractor-ranking-empty">Рейтинг появится после загрузки данных подрядчиков</div>}
       </section>
 
-      <section className="panel analytics-insight"><span className="insight-icon"><Sparkles size={22}/></span><div><span className="eyebrow">AI-ИНСАЙТ</span><h4>Точка роста продуктового каталога</h4><p>{analytics.product_packaging_candidates?.[0] || 'Объедините наиболее востребованные услуги в готовый пакет.'}</p></div><div className="insight-tags">{(analytics.most_requested_products || []).slice(0,3).map(item=><span key={item}>{item}</span>)}</div></section>
+      <div className="analytics-main-grid">
+        <section className="panel analytics-chart"><div className="analytics-title"><div><span className="eyebrow">СПРОС</span><h4>Популярные виды работ</h4></div><small>Последние 90 дней</small></div><div className="horizontal-bars">{productBars.map((item,index)=><div key={item.label}><span><b>{index+1}</b>{item.label}<em>{item.value}%</em></span><i><em style={{width:`${item.value}%`}} /></i></div>)}</div></section>
+        <section className="panel coverage-card"><div className="analytics-title"><div><span className="eyebrow">ДАННЫЕ</span><h4>Покрытие базы ПРОСТОР</h4></div><span className="live-label"><i/>XLSX</span></div><div className="coverage-list">{coverageRows.map(([label,value,max])=><div key={label}><span><b>{label}</b><em>{value.toLocaleString('ru-RU')}</em></span><i><em style={{width:`${Math.min(100,value/max*100)}%`}} /></i></div>)}</div></section>
+      </div>
+
+      <div className="analytics-lower-grid">
+        <section className="panel process-card"><div className="analytics-title"><div><span className="eyebrow">ПРОЦЕСС</span><h4>Контур данных для подготовки ТЗ</h4></div></div><div className="process-funnel"><div><strong>{coverage.orders || 0}</strong><span>РС и заявок</span></div><i>→</i><div><strong>{coverage.operations || 0}</strong><span>операций</span></div><i>→</i><div><strong>{coverage.price_products || 0}</strong><span>продуктов с расценками</span></div><i>→</i><div className="accent"><strong>{coverage.contracts || 0}</strong><span>договоров</span></div></div><p className="process-source">Это не конверсия пользователей. Показан состав XLSX-выгрузки ПРОСТОР: «Договор + РС», «Продукты + Операции», «Продукты + расценки» и «Договоры».</p></section>
+        <section className="panel analytics-risks"><div className="analytics-title"><div><span className="eyebrow">КАЧЕСТВО</span><h4>Что чаще всего нужно уточнить</h4></div></div><ol>{(analytics.typical_request_errors || analytics.common_risk_patterns || []).slice(0,4).map((item,index)=><li key={item}><span>{index+1}</span><b>{item}</b></li>)}</ol></section>
+      </div>
     </div>
   );
 }

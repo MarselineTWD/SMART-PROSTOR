@@ -21,6 +21,7 @@ from backend.app.models.domain import (
 from backend.app.services.normative_acts import normative_act_service
 from backend.app.services.tz_templates import tz_template_service
 from backend.app.services.llm import llm_complete
+from backend.app.services.tz_planning import generate_plan, sync_services
 
 
 ABBREVIATIONS = [
@@ -77,6 +78,7 @@ class TZGenerator:
             updated_at=datetime.now(timezone.utc),
         )
         doc.ready_score = self.compute_ready_score(doc)
+        sync_services(doc, template)
         return doc
 
     # --- Дополнение / полная генерация ---------------------------------------
@@ -88,11 +90,30 @@ class TZGenerator:
         mode: str = "augment",
         instruction: str | None = None,
         section_keys: list[str] | None = None,
+        plan_only: bool = False,
+        knowledge_conditions: list[dict] | None = None,
         template: TZTemplate | None = None,
     ) -> TZDocument:
         template = template or tz_template_service.get_or_default(document.template_key)
+        was_empty = not any(section.content.strip() for section in document.sections)
         ctx = self._context(document, template)
         targets = set(section_keys or [])
+
+        # Точечная генерация раздела не меняет пользовательский план. Полная
+        # генерация и обычное дополнение собирают его заново по услугам и условиям.
+        if not targets:
+            generate_plan(
+                document,
+                template,
+                instruction=instruction,
+                knowledge_conditions=knowledge_conditions,
+            )
+            ctx = self._context(document, template)
+
+        if plan_only:
+            document.updated_at = datetime.now(timezone.utc)
+            document.ready_score = self.compute_ready_score(document)
+            return document
 
         for section in document.sections:
             if targets:
@@ -104,7 +125,7 @@ class TZGenerator:
                 should = not section.content.strip()
             if not should:
                 continue
-            text = self._render_section(section.key, ctx, instruction)
+            text = self._render_section(section.key, section.title, ctx, instruction)
             if text:
                 section.content = text
                 section.source = "ai"
@@ -116,6 +137,8 @@ class TZGenerator:
         else:
             note = "ИИ дополнил недостающие разделы ТЗ."
         document.notes = [*[n for n in document.notes if not n.startswith("ИИ ")], note]
+        if was_empty and any(section.source == "ai" for section in document.sections):
+            document.ai_initially_generated = True
         document.updated_at = datetime.now(timezone.utc)
         document.ready_score = self.compute_ready_score(document)
         return document
@@ -156,6 +179,10 @@ class TZGenerator:
     def _context(self, document: TZDocument, template: TZTemplate) -> dict:
         data = document.input_data
         stages = document.requisites.get("stages") or template.stage_presets
+        services = [
+            item.get("name", "") if isinstance(item, dict) else str(item)
+            for item in document.requisites.get("services", [])
+        ]
         domain_parameters = [
             f"{field.label}: {document.requisites[field.key]}"
             for field in template.fields
@@ -171,6 +198,7 @@ class TZGenerator:
             "deadline": (data.deadline or "").strip() or "[указать дату]",
             "city": str(document.requisites.get("city") or "").strip() or "по месту нахождения Исполнителя",
             "stages": list(stages),
+            "services": [item for item in services if item],
             "domain_parameters": domain_parameters,
             "source_data_ready": bool(data.source_data_ready),
             "needs_3d": bool(data.needs_3d_model),
@@ -179,14 +207,14 @@ class TZGenerator:
             "separate_estimate": bool(data.separate_subcontract_estimate),
         }
 
-    def _render_section(self, key: str, ctx: dict, instruction: str | None) -> str:
+    def _render_section(self, key: str, title: str, ctx: dict, instruction: str | None) -> str:
         renderer = getattr(self, f"_sec_{key}", None)
         if renderer is None:
-            text = self._sec_generic(key, ctx)
+            text = self._sec_generic(title, ctx)
         else:
             text = renderer(ctx)
         # Сначала пробуем LLM, если он настроен; иначе — эвристика.
-        llm = self._llm_section(key, ctx, instruction, text)
+        llm = self._llm_section(key, title, ctx, instruction, text)
         if llm:
             return llm
         if instruction:
@@ -311,15 +339,15 @@ class TZGenerator:
             "сторонами дополнительно. Иные условия по настоящему ТЗ отсутствуют."
         )
 
-    def _sec_generic(self, key: str, ctx: dict) -> str:
+    def _sec_generic(self, title: str, ctx: dict) -> str:
         return (
-            f"Раздел «{key}» по объекту «{ctx['object']}» (Заказчик: {ctx['customer']}). "
+            f"Раздел «{title}» по объекту «{ctx['object']}» (Заказчик: {ctx['customer']}). "
             "Содержание раздела уточняется по согласованию сторон."
         )
 
     # --- Необязательный вызов LLM --------------------------------------------
 
-    def _llm_section(self, key: str, ctx: dict, instruction: str | None, draft_text: str) -> str | None:
+    def _llm_section(self, key: str, title: str, ctx: dict, instruction: str | None, draft_text: str) -> str | None:
         if not settings.llm_enabled:
             return None
         system = (
@@ -328,7 +356,7 @@ class TZGenerator:
             "без воды. Возвращай только текст раздела."
         )
         prompt = (
-            f"Раздел ТЗ: {key}.\n"
+            f"Название раздела ТЗ: {title}. Системный ключ: {key}.\n"
             f"Объект: {ctx['object']}. Заказчик: {ctx['customer']}. Исполнитель: {ctx['executor']}.\n"
             f"Цель: {ctx['goal']}. Срок: {ctx['deadline']}. Этапы: {', '.join(ctx['stages'])}.\n"
             f"Параметры выбранного типа ТЗ: {', '.join(ctx['domain_parameters']) or 'не указаны'}.\n"

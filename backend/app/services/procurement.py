@@ -191,6 +191,65 @@ class ProcurementService:
             "cost_with_vat": round(cost_without_vat + vat, 2),
         }
 
+    def _project_cost_factors(self, context: dict | None, estimated_days: int) -> tuple[list[dict], float, str]:
+        """Прозрачные коэффициенты конкретного ТЗ поверх трудозатрат из РС."""
+        has_project_context = bool(context)
+        context = context or {}
+        requisites = context.get("requisites") or {}
+        input_data = context.get("input_data") or {}
+        location = str(requisites.get("city") or requisites.get("work_location") or "Не указано").strip()
+        location_text = location.lower()
+        factors: list[dict] = []
+
+        remote_markers = ("аркти", "шельф", "офшор", "вахт", "труднодоступ", "удален", "удалён")
+        north_markers = ("ямал", "север", "норильск", "новый уренгой", "надым", "сургут")
+        field_markers = ("месторожд", "куст", "скважин", "промыс")
+        if any(marker in location_text for marker in remote_markers):
+            location_factor, location_reason = 1.25, "Удалённая/арктическая площадка: логистика и полевое обеспечение"
+        elif any(marker in location_text for marker in north_markers):
+            location_factor, location_reason = 1.18, "Северный регион: повышенные логистические затраты"
+        elif any(marker in location_text for marker in field_markers):
+            location_factor, location_reason = 1.10, "Работы на производственном объекте/месторождении"
+        else:
+            location_factor, location_reason = 1.0, "Офисный или неуточнённый формат без логистической надбавки"
+        factors.append({
+            "key": "location", "label": "Место выполнения", "multiplier": location_factor,
+            "reason": f"{location or 'Не указано'}: {location_reason}",
+        })
+
+        if has_project_context and input_data.get("needs_3d_model"):
+            factors.append({
+                "key": "3d_model", "label": "3D-модель", "multiplier": 1.18,
+                "reason": "Дополнительные вычисления, контроль качества и подготовка модели",
+            })
+        if has_project_context and not input_data.get("source_data_ready", False):
+            factors.append({
+                "key": "source_data", "label": "Готовность исходных данных", "multiplier": 1.08,
+                "reason": "Заложена подготовка, проверка и нормализация исходных данных",
+            })
+        if has_project_context and input_data.get("requires_subcontractor"):
+            share = int(input_data.get("subcontract_share_percent") or 0)
+            subcontract_factor = round(1.04 + min(max(share, 0), 70) / 1000, 3)
+            factors.append({
+                "key": "subcontract", "label": "Субподряд", "multiplier": subcontract_factor,
+                "reason": f"Координация субподряда{f' ({share}%)' if share else ''}",
+            })
+
+        start = _pdate(requisites.get("start_date")) or date.today()
+        deadline = _pdate(input_data.get("deadline") or requisites.get("end_date"))
+        if deadline:
+            available_days = max((deadline - start).days, 1)
+            if available_days < estimated_days:
+                factors.append({
+                    "key": "urgency", "label": "Сжатый срок", "multiplier": 1.15,
+                    "reason": f"Доступно {available_days} дней при исторической оценке {estimated_days} дней",
+                })
+
+        multiplier = 1.0
+        for factor in factors:
+            multiplier *= float(factor["multiplier"])
+        return factors, round(multiplier, 4), location or "Не указано"
+
     # --- Длительность и календарь -------------------------------------------
 
     def _span_days(self, calc: dict) -> int:
@@ -241,8 +300,9 @@ class ProcurementService:
         calc: dict,
         stage_names: list[str],
         plan_start: str | None = None,
+        constraints: list[dict] | None = None,
     ) -> tuple[int, list[dict]]:
-        """Распределяет срок подрядчика по этапам пользовательского ТЗ."""
+        """Распределяет срок по этапам ТЗ и добавляет явные периоды паузы."""
         names = [str(name).strip() for name in stage_names if str(name).strip()]
         if not names:
             return self._span_days(calc), []
@@ -278,12 +338,50 @@ class ProcurementService:
                 "offset_days": offset,
                 "percent": round(days * 100 / total, 1),
                 "documentation": historical_item.get("documentation") or "",
-                "start_date": (start + timedelta(days=offset)).isoformat(),
-                "end_date": (start + timedelta(days=offset + days)).isoformat(),
+                "kind": "work",
+                "delay_reason": "",
+                "billable_percent": 0,
             })
             offset += days
             remaining -= days
-        return total, out
+
+        pauses_by_stage: dict[int, list[dict]] = defaultdict(list)
+        for raw in constraints or []:
+            try:
+                raw_days = int(raw.get("days") or 0)
+                if raw_days <= 0:
+                    continue
+                days = min(365, raw_days)
+                after_stage = max(0, min(len(out), int(raw.get("after_stage") or 0)))
+                billable = max(0.0, min(100.0, float(raw.get("billable_percent") or 0)))
+            except (TypeError, ValueError):
+                continue
+            reason = str(raw.get("reason") or "Дополнительное условие").strip()
+            pauses_by_stage[after_stage].append({
+                "name": f"Приостановление: {reason}",
+                "days": days,
+                "documentation": reason,
+                "kind": "pause",
+                "delay_reason": reason,
+                "billable_percent": billable,
+            })
+
+        timeline: list[dict] = [*pauses_by_stage.get(0, [])]
+        for index, stage in enumerate(out, start=1):
+            timeline.append(stage)
+            timeline.extend(pauses_by_stage.get(index, []))
+
+        timeline_total = sum(item["days"] for item in timeline)
+        offset = 0
+        for index, item in enumerate(timeline, start=1):
+            item["order"] = index
+            item["weeks"] = round(item["days"] / 7, 1)
+            item["offset_days"] = offset
+            item["percent"] = round(item["days"] * 100 / timeline_total, 1)
+            item["start_date"] = (start + timedelta(days=offset)).isoformat()
+            item["end_date"] = (start + timedelta(days=offset + item["days"])).isoformat()
+            offset += item["days"]
+        return timeline_total, timeline
 
     def _cost_for_calc(self, product_id: str, calc: dict) -> dict:
         total = self._span_days(calc)
@@ -353,6 +451,8 @@ class ProcurementService:
         *,
         roadmap_stages: list[str] | None = None,
         plan_start: str | None = None,
+        roadmap_constraints: list[dict] | None = None,
+        project_context: dict | None = None,
     ) -> dict | None:
         """Для продукта — срок, роадмап и индикативная стоимость подрядчиков."""
         self._load()
@@ -371,6 +471,13 @@ class ProcurementService:
         ]
 
         companies = []
+        excluded_contractors = []
+        context = project_context or {}
+        requisites = context.get("requisites") or {}
+        input_data = context.get("input_data") or {}
+        requested_start = _pdate(requisites.get("start_date")) or date.today()
+        requested_deadline = _pdate(input_data.get("deadline") or requisites.get("end_date"))
+        available_days = (requested_deadline - requested_start).days if requested_deadline else None
         for cid, comp_calcs in by_company.items():
             rep = max(
                 comp_calcs,
@@ -378,24 +485,67 @@ class ProcurementService:
             )
             spans = [self._span_days(c) for c in comp_calcs]
             total, roadmap = (
-                self._build_tz_roadmap(rep, roadmap_stages, plan_start)
+                self._build_tz_roadmap(rep, roadmap_stages, plan_start, roadmap_constraints)
                 if roadmap_stages
                 else self._build_roadmap(rep)
             )
             info = self.companies.get(cid, {})
             contract = self.contracts.get(rep.get("contract_id") or "", {})
-            workdays = max(round(total * WORKDAYS_PER_CALENDAR), 1)
-            base_breakdown = self._cost_breakdown(product_id, workdays)
-            base_cost_without_vat = base_breakdown["cost_without_vat"]
-            selected_services = []
+            exclusion_reasons: list[str] = []
+            if not contract or contract.get("company_id") != cid:
+                exclusion_reasons.append("Нет подтверждённого договора с этим подрядчиком")
+
+            additional_calcs: dict[str, dict] = {}
             for additional_id in selected_additional_ids:
                 candidate_calcs = [
                     calc for calc in self.calcs_by_product.get(additional_id, [])
                     if calc["company_id"] == cid
                 ]
-                if not candidate_calcs:
-                    continue
-                additional_calc = min(candidate_calcs, key=self._span_days)
+                if candidate_calcs:
+                    additional_calcs[additional_id] = min(candidate_calcs, key=self._span_days)
+                else:
+                    additional_name = self.products.get(additional_id, {}).get("name") or additional_id
+                    exclusion_reasons.append(f"Нет подтверждённого расчёта по допуслуге «{additional_name}»")
+
+            capability_text = " ".join(filter(None, [
+                info.get("services", ""), info.get("info", ""), rep.get("name", ""),
+                self.products.get(product_id, {}).get("name", ""),
+                " ".join(self.operations_by_product.get(product_id, [])),
+            ])).lower()
+            if input_data.get("needs_3d_model") and not any(
+                marker in capability_text for marker in ("3d", "3д", "модел", "геолог")
+            ):
+                exclusion_reasons.append("В профиле и расчётах нет подтверждённой компетенции по 3D-моделированию")
+
+            if available_days is not None and (available_days <= 0 or total > available_days):
+                exclusion_reasons.append(
+                    f"Срок недостижим: требуется {total} дней, доступно {max(available_days, 0)}"
+                )
+
+            if exclusion_reasons:
+                excluded_contractors.append({
+                    "company_id": cid,
+                    "company_name": info.get("name", cid),
+                    "reasons": exclusion_reasons,
+                })
+                continue
+
+            working_calendar_days = sum(
+                stage["days"] for stage in roadmap if stage.get("kind", "work") != "pause"
+            ) or total
+            workdays = max(round(working_calendar_days * WORKDAYS_PER_CALENDAR), 1)
+            base_breakdown = self._cost_breakdown(product_id, workdays)
+            cost_factors, project_multiplier, location = self._project_cost_factors(project_context, total)
+            work_cost_without_vat = round(base_breakdown["cost_without_vat"] * project_multiplier, 2)
+            calendar_day_cost = work_cost_without_vat / max(working_calendar_days, 1)
+            delay_cost_without_vat = round(sum(
+                calendar_day_cost * stage["days"] * float(stage.get("billable_percent") or 0) / 100
+                for stage in roadmap if stage.get("kind") == "pause"
+            ), 2)
+            base_cost_without_vat = round(work_cost_without_vat + delay_cost_without_vat, 2)
+            selected_services = []
+            for additional_id in selected_additional_ids:
+                additional_calc = additional_calcs[additional_id]
                 additional_cost = self._cost_for_calc(additional_id, additional_calc)
                 additional_name = (
                     self.products.get(additional_id, {}).get("name")
@@ -406,16 +556,32 @@ class ProcurementService:
                     "product_id": additional_id,
                     "name": additional_name,
                     "estimated_days": additional_cost["estimated_days"],
-                    "cost_without_vat": additional_cost["cost_without_vat"],
+                    "cost_without_vat": round(additional_cost["cost_without_vat"] * project_multiplier, 2),
                     "team": additional_cost["team"],
                 })
             additional_cost_without_vat = round(sum(item["cost_without_vat"] for item in selected_services), 2)
             cost_without_vat = round(base_cost_without_vat + additional_cost_without_vat, 2)
             vat_amount = round(cost_without_vat * VAT_RATE, 2)
             for stage in roadmap:
-                stage["estimated_cost_without_vat"] = round(
-                    base_cost_without_vat * stage["percent"] / 100, 2
-                )
+                if stage.get("kind") == "pause":
+                    stage["estimated_cost_without_vat"] = round(
+                        calendar_day_cost * stage["days"] * float(stage.get("billable_percent") or 0) / 100, 2
+                    )
+                else:
+                    stage["estimated_cost_without_vat"] = round(
+                        work_cost_without_vat * stage["days"] / max(working_calendar_days, 1), 2
+                    )
+            rating = float(info.get("rating") or 0)
+            feasibility = 10
+            suitability_score = min(100, round(55 + rating * 5 + min(len(comp_calcs), 5) * 2 + feasibility))
+            selection_reasons = [
+                "Есть договор и расчёт по выбранной категории услуг",
+                f"Исторических вариантов РС: {len(comp_calcs)}",
+                f"Рейтинг подрядчика: {rating:g}/5" if rating else "Рейтинг в базе не указан",
+                "Срок укладывается в дедлайн" if requested_deadline else "Жёсткий дедлайн не задан",
+            ]
+            if selected_additional_ids:
+                selection_reasons.append("Есть расчёты по всем выбранным дополнительным услугам")
             companies.append({
                 "company_id": cid,
                 "company_name": info.get("name", cid),
@@ -454,23 +620,45 @@ class ProcurementService:
                 "base_cost_without_vat": base_cost_without_vat,
                 "additional_cost_without_vat": additional_cost_without_vat,
                 "additional_services": selected_services,
+                "location": location,
+                "location_factor": next(f["multiplier"] for f in cost_factors if f["key"] == "location"),
+                "project_multiplier": project_multiplier,
+                "cost_factors": cost_factors,
+                "suitability_score": suitability_score,
+                "selection_reasons": selection_reasons,
             })
         companies.sort(key=lambda r: (r["cost_without_vat"], r["estimated_days"], -(r["rating"] or 0)))
 
         days = [c["estimated_days"] for c in companies]
         costs = [c["cost_without_vat"] for c in companies]
+        _, _, summary_location = self._project_cost_factors(project_context, min(days) if days else 1)
         summary = {
             "company_count": len(companies),
-            "fastest_days": min(days),
-            "slowest_days": max(days),
-            "average_days": round(sum(days) / len(days)),
-            "fastest_company": min(companies, key=lambda c: c["estimated_days"])["company_name"],
-            "lowest_cost_without_vat": min(costs),
-            "highest_cost_without_vat": max(costs),
-            "average_cost_without_vat": round(sum(costs) / len(costs), 2),
-            "lowest_cost_company": min(companies, key=lambda c: c["cost_without_vat"])["company_name"],
+            "excluded_company_count": len(excluded_contractors),
+            "fastest_days": min(days) if days else 0,
+            "slowest_days": max(days) if days else 0,
+            "average_days": round(sum(days) / len(days)) if days else 0,
+            "fastest_company": min(companies, key=lambda c: c["estimated_days"])["company_name"] if companies else "",
+            "lowest_cost_without_vat": min(costs) if costs else 0,
+            "highest_cost_without_vat": max(costs) if costs else 0,
+            "average_cost_without_vat": round(sum(costs) / len(costs), 2) if costs else 0,
+            "lowest_cost_company": min(companies, key=lambda c: c["cost_without_vat"])["company_name"] if companies else "",
             "vat_rate": VAT_RATE,
             "cost_disclaimer": COST_DISCLAIMER,
+            "location": companies[0]["location"] if companies else summary_location,
+            "selection_criteria": [
+                "Совпадение категории работ ТЗ с продуктом каталога",
+                "Наличие договора и исторического расчёта РС у подрядчика",
+                "Поддержка всех выбранных допуслуг и подтверждённых компетенций ТЗ",
+                "Рейтинг, число доступных вариантов РС и достижимость заданного срока",
+                "Топ-3 ранжируется по итоговой индикативной стоимости",
+            ],
+            "pricing_criteria": [
+                "Состав команды, грейды L2–L5, ставки, загрузка и длительность",
+                "Место выполнения и логистическая сложность",
+                "Готовность исходных данных, необходимость 3D и субподряда",
+                "Срочность, платные приостановки и дополнительные услуги",
+            ],
         }
         return {
             "product_id": product_id,
@@ -478,6 +666,7 @@ class ProcurementService:
             "operations": self.operations_by_product.get(product_id, []),
             "roles": sorted(self.roles_by_product.get(product_id, [])),
             "companies": companies,
+            "excluded_contractors": excluded_contractors,
             "summary": summary,
             "available_additional_services": available_additional_services,
             "selected_additional_product_ids": selected_additional_ids,
@@ -524,6 +713,11 @@ class ProcurementService:
                 additional_product_ids,
                 roadmap_stages=user_stages,
                 plan_start=(getattr(tz, "requisites", {}) or {}).get("start_date"),
+                roadmap_constraints=(getattr(tz, "requisites", {}) or {}).get("schedule_constraints") or [],
+                project_context={
+                    "requisites": getattr(tz, "requisites", {}) or {},
+                    "input_data": getattr(tz, "input_data", None).model_dump(mode="json"),
+                },
             )
             if estimate:
                 estimate["roadmap_source"] = "tz"

@@ -8,9 +8,10 @@ from backend.app.models.domain import (
     TZDocument,
     TZDocumentSection,
     TZFieldUpdate,
+    TZFeedback,
     TZTemplate,
 )
-from backend.app.schemas.assistant import AllowedField
+from backend.app.schemas.assistant import AllowedField, AssistantDiscovery
 
 
 # --- Шаблоны ------------------------------------------------------------------
@@ -44,6 +45,8 @@ class TZCreateRequest(BaseModel):
     contract_name: str | None = None
     input_data: DraftInputData = Field(default_factory=DraftInputData)
     requisites: dict[str, Any] = Field(default_factory=dict)
+    sections: list[TZDocumentSection] | None = None
+    ai_initially_generated: bool = False
     auto_fill: bool = False
 
 
@@ -57,12 +60,24 @@ class TZUpdateRequest(BaseModel):
     input_data: DraftInputData | None = None
     requisites: dict[str, Any] | None = None
     sections: list[TZDocumentSection] | None = None
+    ai_initially_generated: bool | None = None
 
 
 class TZGenerateRequest(BaseModel):
     mode: Literal["augment", "full"] = "augment"
     instruction: str | None = None
     section_keys: list[str] | None = None
+    plan_only: bool = False
+
+
+class TZPreviewGenerateRequest(TZGenerateRequest):
+    document: TZDocument
+
+
+class TZCompleteRequest(BaseModel):
+    document: TZDocument
+    company_id: str
+    additional_product_ids: list[str] = Field(default_factory=list)
 
 
 class TZSwitchTemplateRequest(BaseModel):
@@ -102,11 +117,19 @@ class TZDocumentSummary(BaseModel):
     customer_name: str | None = None
     status: str = "draft"
     ready_score: int = 0
+    executor_name: str | None = None
+    ai_initially_generated: bool = False
+    feedback: TZFeedback = Field(default_factory=TZFeedback)
     updated_at: str | None = None
 
 
 class TZListResponse(BaseModel):
     documents: list[TZDocumentSummary]
+
+
+class TZFeedbackRequest(BaseModel):
+    ai_initially_generated: bool = False
+    feedback: TZFeedback
 
 
 # --- Чат по документу ТЗ ------------------------------------------------------
@@ -122,6 +145,7 @@ class TZChatSendResponse(BaseModel):
     model: str | None = None
     fallback: bool = False
     validation: TZValidationResult
+    discovery: AssistantDiscovery | None = None
 
 
 class TZChatHistoryResponse(BaseModel):

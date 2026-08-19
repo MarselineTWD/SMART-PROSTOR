@@ -18,6 +18,7 @@ from backend.app.models.domain import (
     TZTemplate,
 )
 from backend.app.schemas.assistant import AllowedField
+from backend.app.services.tz_planning import normalize_services
 
 
 # Канонические места хранения (совпадают с tz_validation и tz_generator).
@@ -59,6 +60,9 @@ class TZChatService:
             AllowedField(target="input_data", key=key, label=label, type=field_type)
             for key, label, field_type in INPUT_DATA_FIELDS
         ]
+        fields.append(
+            AllowedField(target="requisites", key="services", label="Услуги", type="services")
+        )
         covered = set(DOCUMENT_FIELDS) | _INPUT_KEYS | {"stages"}
         for field in template.fields:
             if field.key in covered:
@@ -71,7 +75,9 @@ class TZChatService:
                     type=field.input_type,
                 )
             )
-        for section in template.sections:
+        # Пользовательские разделы живут в документе, а не в шаблоне. Передаём
+        # агенту их фактические названия, чтобы он понимал назначение поля.
+        for section in document.sections:
             fields.append(
                 AllowedField(target="section", key=section.key, label=section.title, type="textarea")
             )
@@ -182,6 +188,8 @@ def _as_int(value: object) -> int | None:
 
 
 def _coerce_req(field_type: str, value: object) -> object:
+    if field_type == "services":
+        return normalize_services(value)
     if field_type == "checkbox":
         return _as_bool(value)
     if field_type == "number":

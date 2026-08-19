@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 
@@ -10,6 +11,7 @@ from backend.app.core.config import settings
 
 
 logger = logging.getLogger(__name__)
+_transport_disabled_until = 0.0
 
 
 def llm_complete(
@@ -20,7 +22,10 @@ def llm_complete(
     json_mode: bool = False,
     max_tokens: int = 900,
 ) -> str | None:
+    global _transport_disabled_until
     if not settings.llm_enabled:
+        return None
+    if time.monotonic() < _transport_disabled_until:
         return None
     payload = {
         "model": settings.llm_model,
@@ -46,11 +51,21 @@ def llm_complete(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=settings.llm_timeout) as response:
+        # A broken upstream must not freeze every chat message. After one transport
+        # failure the deterministic assistant takes over for the next minute.
+        timeout = min(max(float(settings.llm_timeout), 1.0), 15.0)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
         content = data["choices"][0]["message"]["content"]
+        _transport_disabled_until = 0.0
         return str(content).strip() or None
+    except urllib.error.HTTPError as exc:
+        # JSON mode may be unsupported by an OpenAI-compatible gateway; the caller
+        # can retry without response_format immediately.
+        logger.warning("LLM HTTP request failed (%s); fallback or compatibility retry is used", exc.code)
+        return None
     except (urllib.error.URLError, KeyError, ValueError, TimeoutError, OSError) as exc:
+        _transport_disabled_until = time.monotonic() + 60.0
         logger.warning("LLM request failed (%s); deterministic fallback is used", type(exc).__name__)
         return None
 
@@ -71,6 +86,13 @@ def llm_complete_json(
     raw = llm_complete(
         system, prompt, temperature=temperature, json_mode=True, max_tokens=max_tokens
     )
+    if not raw:
+        # Некоторые OpenAI-совместимые шлюзы временно не принимают
+        # response_format. Повторяем тот же запрос без JSON-mode и разбираем
+        # объект из текста, прежде чем переходить на локальные правила.
+        raw = llm_complete(
+            system, prompt, temperature=temperature, json_mode=False, max_tokens=max_tokens
+        )
     if not raw:
         return None
     parsed = _loads_relaxed(raw)

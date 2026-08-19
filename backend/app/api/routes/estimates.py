@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
 
+from backend.app.models.domain import TZDocument
 from backend.app.schemas.estimate import (
     MatchResponse,
     ProductEstimateResponse,
@@ -42,4 +43,13 @@ async def estimate_for_tz(
     document = await tz_repository.get(tz_id)
     if document is None:
         raise HTTPException(status_code=404, detail="ТЗ не найдено")
+    return procurement_service.estimate_for_tz(document, additional_product_ids)
+
+
+@router.post("/for-draft", response_model=TZEstimateResponse)
+def estimate_for_draft(
+    document: TZDocument,
+    additional_product_ids: list[str] = Query(default=[]),
+) -> TZEstimateResponse:
+    """Рассчитывает подрядчиков и Гант для ТЗ до его сохранения."""
     return procurement_service.estimate_for_tz(document, additional_product_ids)

@@ -1,10 +1,12 @@
 """Тесты структурированного чата: очистка, белый список, маршрутизация правок."""
 import unittest
 
-from backend.app.models.domain import TZFieldUpdate
+from backend.app.models.domain import TZDocumentSection, TZFieldUpdate
 from backend.app.schemas.assistant import AllowedField, AssistantChatRequest, AssistantReply
 from backend.app.services.assistant import assistant_service, sanitize_text
+from backend.app.services.assistant_context import _build_discovery, collect_exceptional_conditions
 from backend.app.services.llm import _loads_relaxed
+from backend.app.services.search import search_service
 from backend.app.services.tz_chat import tz_chat_service
 from backend.app.services.tz_generator import tz_generator
 from backend.app.services.tz_templates import tz_template_service
@@ -70,6 +72,15 @@ class WhitelistTest(unittest.TestCase):
         self.assertLessEqual(result.field_updates[0].confidence, 1.0)
         self.assertEqual(result.field_updates[0].label, "Объект работ")
 
+    def test_action_response_does_not_keep_follow_up_question(self):
+        allowed = [AllowedField(target="document", key="object_name", label="Объект")]
+        result = assistant_service._postprocess(AssistantReply(
+            reply="Заполняю объект. Уточните заказчика и исполнителя?",
+            field_updates=[TZFieldUpdate(target="document", key="object_name", value="Куст 18")],
+        ), allowed)
+        self.assertNotIn("?", result.reply)
+        self.assertNotIn("Уточните", result.reply)
+
 
 class RoutingApplyTest(unittest.TestCase):
     def test_apply_routes_values_to_correct_places(self):
@@ -106,6 +117,39 @@ class RoutingApplyTest(unittest.TestCase):
         allowed = tz_chat_service.allowed_fields(document, template)
         targets = {a.target for a in allowed}
         self.assertEqual(targets, {"document", "input_data", "requisites", "section"})
+        services = next(item for item in allowed if item.key == "services")
+        self.assertEqual(services.type, "services")
+
+    def test_ai_can_fill_structured_services(self):
+        document, template = _new_doc()
+        applied, skipped = tz_chat_service.apply(document, template, [TZFieldUpdate(
+            target="requisites",
+            key="services",
+            value=[{"name": "Петрофизическая интерпретация"}, {"name": "Анализ керна"}],
+        )])
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(
+            [item["name"] for item in document.requisites["services"]],
+            ["Петрофизическая интерпретация", "Анализ керна"],
+        )
+
+    def test_custom_section_title_is_exposed_to_agent(self):
+        document, template = _new_doc()
+        document.sections.append(TZDocumentSection(
+            key="custom-security", title="Требования к информационной безопасности"
+        ))
+        allowed = tz_chat_service.allowed_fields(document, template)
+        field = next(item for item in allowed if item.key == "custom-security")
+        self.assertEqual(field.target, "section")
+        self.assertEqual(field.label, "Требования к информационной безопасности")
+
+        applied, skipped = tz_chat_service.apply(document, template, [TZFieldUpdate(
+            target="section", key="custom-security", value="Соблюдать требования ИБ."
+        )])
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(document.sections[-1].content, "Соблюдать требования ИБ.")
 
 
 class FallbackTest(unittest.TestCase):
@@ -128,6 +172,65 @@ class FallbackTest(unittest.TestCase):
         )
         result = assistant_service._postprocess(reply, None)
         self.assertEqual(result.field_updates, [])
+
+    def test_fallback_extracts_fields_for_unsaved_constructor(self):
+        allowed = [
+            AllowedField(target="document", key="object_name", label="Объект работ"),
+            AllowedField(target="input_data", key="goal", label="Цель работ"),
+            AllowedField(target="input_data", key="deadline", label="Плановый срок", type="date"),
+        ]
+        reply = assistant_service._fallback(
+            "Нужно подготовить концепт, объект: Северный участок, срок 2026-12-20",
+            {"knowledge_base": {"created_tz_count": 12}},
+            allowed,
+        )
+        processed = assistant_service._postprocess(reply, allowed)
+        keys = {(item.target, item.key) for item in processed.field_updates}
+        self.assertIn(("document", "object_name"), keys)
+        self.assertIn(("input_data", "goal"), keys)
+        self.assertIn(("input_data", "deadline"), keys)
+
+    def test_fallback_uses_chat_history_and_extracts_location(self):
+        allowed = [
+            AllowedField(target="document", key="object_name", label="Объект"),
+            AllowedField(target="requisites", key="city", label="Место выполнения"),
+        ]
+        reply = assistant_service._fallback(
+            "Заполни ТЗ по нашей переписке",
+            {"tz": {}},
+            allowed,
+            [("user", "Объект: Куст 18, место работ: Ямал")],
+        )
+        keys = {(item.target, item.key): item.value for item in reply.field_updates}
+        self.assertEqual(keys[("document", "object_name")], "Куст 18")
+        self.assertEqual(keys[("requisites", "city")], "Ямал")
+
+    def test_exceptional_conditions_keep_source_tz(self):
+        document, _ = _new_doc()
+        document.title = "Похожее ТЗ"
+        document.requisites["schedule_constraints"] = [{"reason": "Ледовая обстановка", "days": 10}]
+        conditions = next(section for section in document.sections if section.key == "conditions")
+        conditions.content = "Остановка полевых работ при штормовом предупреждении."
+        rows = collect_exceptional_conditions([document], "похожее ТЗ")
+        self.assertTrue(rows)
+        self.assertTrue(all(row["source_tz_id"] == document.id for row in rows))
+        self.assertTrue(any(row["field"] == "requisites.schedule_constraints" for row in rows))
+
+    def test_reserves_query_returns_complete_discovery(self):
+        search = search_service.search("Хочу подсчитать запасы на скважине", limit=3)
+        discovery = _build_discovery(search, [], {
+            "current_document": {"input_data": {"source_data_ready": False}, "requisites": {}},
+        })
+        self.assertEqual(discovery["intent"]["code"], "service_search")
+        self.assertGreater(discovery["intent"]["confidence"], 0.8)
+        self.assertEqual(discovery["services"][0]["product_id"], "product-reserves")
+        self.assertTrue(discovery["contractors"])
+        self.assertTrue(all(item["service_name"] == "Подсчёт запасов / ПТД" for item in discovery["contractors"]))
+        self.assertTrue(discovery["similar_tz"])
+        self.assertTrue(discovery["filling_recommendations"])
+        statuses = {item["status"] for item in discovery["conditional_services"]}
+        self.assertIn("обязательна до расчёта", statuses)
+        self.assertIn("может быть обязательной", statuses)
 
 
 if __name__ == "__main__":

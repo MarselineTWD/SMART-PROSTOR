@@ -1,11 +1,15 @@
+import asyncio
 import shutil
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from docx import Document as DocxDocument
 
-from backend.app.models.domain import DraftInputData
+from backend.app.models.domain import DraftInputData, TZDocumentSection, TZFeedback
+from backend.app.api.routes.tz import complete_document
 from backend.app.schemas.draft import DraftFromSearchRequest
+from backend.app.schemas.tz import TZCompleteRequest
 from backend.app.services.documents import document_export_service
 from backend.app.services.drafts import draft_service
 from backend.app.services.procurement import procurement_service
@@ -16,6 +20,20 @@ from backend.app.services.tz_validation import tz_validation_service
 
 
 class ProstorMvpTest(unittest.TestCase):
+    def test_docx_export_converts_ai_markdown_to_native_formatting(self):
+        doc = DocxDocument()
+        document_export_service._add_formatted_text(
+            doc,
+            "### Результаты\n**Важно:** проверить данные\n- `Итоговый` отчёт\n```text\nБез ограждения\n```",
+        )
+        document_export_service._add_heading(doc, "1. ### Служебный заголовок", level=1)
+        text = "\n".join(paragraph.text for paragraph in doc.paragraphs)
+        for marker in ("###", "**", "```", "`"):
+            self.assertNotIn(marker, text)
+        self.assertIn("Результаты", text)
+        self.assertIn("Важно: проверить данные", text)
+        self.assertTrue(any(run.bold and "Важно:" in run.text for p in doc.paragraphs for run in p.runs))
+
     def test_reserves_query_returns_reserves_product(self):
         result = search_service.search(
             "Нужно оценить запасы по объекту и подготовить проектно-технический документ",
@@ -66,12 +84,54 @@ class ProstorMvpTest(unittest.TestCase):
             # Никаких xlsx рядом с результатом.
             self.assertEqual(list(docx_path.parent.glob("*.xlsx")), [])
             # Файл открывается как валидный docx.
-            self.assertGreater(len(DocxDocument(str(docx_path)).paragraphs), 5)
+            exported = DocxDocument(str(docx_path))
+            self.assertGreater(len(exported.paragraphs), 5)
+            exported_text = "\n".join(paragraph.text for paragraph in exported.paragraphs)
+            self.assertIn("Оформление: исходный шаблон", exported_text)
+            self.assertIn("Состав услуг", exported_text)
+            self.assertIn("Этапы и календарный план", exported_text)
+            self.assertGreaterEqual(len(exported.tables), 3)
         finally:
             shutil.rmtree(Path(docx_path).parent, ignore_errors=True)
 
 
 class TZTemplatesTest(unittest.TestCase):
+    def test_services_and_plan_depend_on_tz_conditions(self):
+        template = tz_template_service.get_template("tz-geology-concept")
+        simple = tz_generator.new_document(
+            template,
+            input_data=DraftInputData(source_data_ready=True),
+        )
+        complex_tz = tz_generator.new_document(
+            template,
+            input_data=DraftInputData(
+                source_data_ready=False,
+                needs_3d_model=True,
+                requires_subcontractor=True,
+                separate_subcontract_estimate=True,
+            ),
+        )
+        complex_tz.requisites["services"].append({
+            "name": "Петрофизическая интерпретация",
+            "mandatory": False,
+            "source": "manual",
+        })
+
+        tz_generator.generate(simple, plan_only=True, template=template)
+        tz_generator.generate(complex_tz, plan_only=True, template=template)
+
+        service_names = {item["name"] for item in complex_tz.requisites["services"]}
+        self.assertIn("Построение и проверка 3D-модели", service_names)
+        self.assertIn("Петрофизическая интерпретация", service_names)
+        self.assertNotEqual(simple.requisites["stages"], complex_tz.requisites["stages"])
+        self.assertGreater(len(complex_tz.requisites["stages"]), len(simple.requisites["stages"]))
+
+        removed = next(item for item in complex_tz.requisites["services"] if item["source"] == "rule")
+        complex_tz.requisites["services"].remove(removed)
+        complex_tz.requisites["removed_auto_services"] = [removed["name"]]
+        tz_generator.generate(complex_tz, plan_only=True, template=template)
+        self.assertNotIn(removed["name"], {item["name"] for item in complex_tz.requisites["services"]})
+
     def test_catalog_has_all_templates(self):
         templates = tz_template_service.list_templates()
         self.assertEqual(len(templates), 11)
@@ -121,6 +181,27 @@ class TZGeneratorTest(unittest.TestCase):
         self.assertTrue(all(s.content.strip() for s in doc.sections))
         self.assertTrue(all(s.source == "ai" for s in doc.sections))
         self.assertGreaterEqual(doc.ready_score, 60)
+        self.assertTrue(doc.ai_initially_generated)
+
+    def test_custom_section_is_generated_using_its_title(self):
+        tpl, doc = self._doc()
+        doc.sections.append(TZDocumentSection(
+            key="custom-security", title="Требования к информационной безопасности"
+        ))
+        tz_generator.generate(doc, section_keys=["custom-security"], template=tpl)
+        custom = doc.sections[-1]
+        self.assertIn("Требования к информационной безопасности", custom.content)
+        self.assertEqual(custom.source, "ai")
+
+    def test_feedback_rating_is_limited_to_five_point_scale(self):
+        feedback = TZFeedback(
+            contractor={"rating": 5, "comment": "Работы выполнены качественно"},
+            ai_tz={"rating": 4, "comment": "Потребовалась небольшая доработка"},
+            ai_chat={"rating": 5, "comment": "Полезные ответы"},
+        )
+        self.assertEqual(feedback.contractor.rating, 5)
+        with self.assertRaises(ValueError):
+            TZFeedback(contractor={"rating": 6})
 
     def test_augment_keeps_manual_sections(self):
         tpl, doc = self._doc()
@@ -190,7 +271,8 @@ class ProcurementEstimateTest(unittest.TestCase):
         estimate = procurement_service.estimate_product(product["product_id"])
         self.assertIsNotNone(estimate)
         self.assertGreater(estimate["summary"]["lowest_cost_without_vat"], 0)
-        self.assertIn("1 000", estimate["summary"]["cost_disclaimer"])
+        self.assertIn("L2", estimate["summary"]["cost_disclaimer"])
+        self.assertIn("12 000", estimate["summary"]["cost_disclaimer"])
         for company in estimate["companies"]:
             self.assertGreater(company["cost_without_vat"], 0)
             self.assertEqual(company["cost_confidence"], "indicative")
@@ -220,6 +302,45 @@ class ProcurementEstimateTest(unittest.TestCase):
                 company["base_cost_without_vat"] + company["additional_cost_without_vat"],
             )
 
+    def test_contractors_without_selected_service_are_excluded(self):
+        base = None
+        addon = None
+        for product in procurement_service.list_products():
+            candidate = procurement_service.estimate_product(product["product_id"])
+            partial = next((item for item in candidate["available_additional_services"]
+                            if item["common_company_count"] < candidate["summary"]["company_count"]), None)
+            if partial:
+                base, addon = candidate, partial
+                break
+        self.assertIsNotNone(base)
+
+        result = procurement_service.estimate_product(
+            base["product_id"], additional_product_ids=[addon["product_id"]]
+        )
+        self.assertEqual(len(result["companies"]), addon["common_company_count"])
+        self.assertEqual(
+            result["summary"]["excluded_company_count"],
+            base["summary"]["company_count"] - addon["common_company_count"],
+        )
+        self.assertTrue(all(company["additional_services"] for company in result["companies"]))
+        self.assertTrue(all(row["reasons"] for row in result["excluded_contractors"]))
+
+    def test_impossible_deadline_excludes_contractors_with_reason(self):
+        product_id = procurement_service.list_products()[0]["product_id"]
+        result = procurement_service.estimate_product(
+            product_id,
+            project_context={
+                "requisites": {"start_date": "2026-08-19"},
+                "input_data": {"deadline": "2026-08-20"},
+            },
+        )
+        self.assertEqual(result["companies"], [])
+        self.assertGreater(result["summary"]["excluded_company_count"], 0)
+        self.assertTrue(all(
+            any("Срок недостижим" in reason for reason in company["reasons"])
+            for company in result["excluded_contractors"]
+        ))
+
     def test_tz_roadmap_uses_only_stages_written_in_document(self):
         template = tz_template_service.get_template("tz-geology-concept")
         document = tz_generator.new_document(
@@ -248,8 +369,101 @@ class ProcurementEstimateTest(unittest.TestCase):
         document.requisites["stages"] = []
         self.assertIsNone(procurement_service.estimate_for_tz(document)["estimate"])
 
+    def test_tz_roadmap_includes_explicit_pause_and_its_cost(self):
+        template = tz_template_service.get_template("tz-geology-concept")
+        document = tz_generator.new_document(
+            template,
+            title="ТЗ: Концепт геологии",
+            input_data=DraftInputData(goal="Подготовить концепт геологии"),
+        )
+        document.requisites["stages"] = ["Сбор данных", "Интерпретация", "Отчёт"]
+        document.requisites["schedule_constraints"] = [{
+            "after_stage": 1,
+            "reason": "Ожидание исходных данных",
+            "days": 7,
+            "billable_percent": 25,
+        }]
+        estimate = procurement_service.estimate_for_tz(document)["estimate"]
+        self.assertIsNotNone(estimate)
+        for company in estimate["companies"]:
+            pauses = [stage for stage in company["stages"] if stage.get("kind") == "pause"]
+            self.assertEqual(len(pauses), 1)
+            self.assertEqual(pauses[0]["days"], 7)
+            self.assertEqual(pauses[0]["billable_percent"], 25)
+            self.assertGreater(pauses[0]["estimated_cost_without_vat"], 0)
+            self.assertEqual(sum(stage["days"] for stage in company["stages"]), company["estimated_days"])
+
+    def test_location_and_project_conditions_change_explainable_price(self):
+        template = tz_template_service.get_template("tz-geology-concept")
+        document = tz_generator.new_document(
+            template,
+            title="ТЗ: Концепт геологии",
+            input_data=DraftInputData(goal="Подготовить концепт геологии", source_data_ready=True),
+        )
+        document.requisites.update({"stages": ["Сбор данных", "Интерпретация", "Отчёт"], "city": "Москва"})
+        office = procurement_service.estimate_for_tz(document)["estimate"]
+
+        remote = document.model_copy(deep=True)
+        remote.requisites["city"] = "Ямал, удалённое месторождение"
+        remote.input_data.needs_3d_model = True
+        field = procurement_service.estimate_for_tz(remote)["estimate"]
+
+        self.assertIsNotNone(office)
+        self.assertIsNotNone(field)
+        office_prices = {row["company_id"]: row["cost_without_vat"] for row in office["companies"]}
+        for company in field["companies"]:
+            self.assertGreater(company["cost_without_vat"], office_prices[company["company_id"]])
+            factor_keys = {factor["key"] for factor in company["cost_factors"]}
+            self.assertIn("location", factor_keys)
+            self.assertIn("3d_model", factor_keys)
+            self.assertGreater(company["location_factor"], 1)
+        self.assertEqual(field["summary"]["location"], "Ямал, удалённое месторождение")
+
 
 class TZValidationTest(unittest.TestCase):
+    def test_contractor_selection_completes_and_persists_tz(self):
+        template = tz_template_service.get_template("tz-geology-concept")
+        document = tz_generator.new_document(
+            template,
+            title="ТЗ: Концепт геологии",
+            object_name="Северный участок",
+            customer_name="Блок геологии",
+            input_data=DraftInputData(
+                goal="Подготовить геологическую концепцию",
+                deadline="2029-12-31",
+                source_data_ready=True,
+            ),
+        )
+        document.requisites.update({
+            "target_horizons": "Ю1–Ю4",
+            "stages": list(template.stage_presets),
+        })
+        for section in document.sections:
+            section.content = f"Заполненный раздел: {section.title}"
+
+        estimate = procurement_service.estimate_for_tz(document)["estimate"]
+        self.assertTrue(estimate["companies"])
+        company = estimate["companies"][0]
+        self.assertEqual(tz_validation_service.validate(document).ready_score, 100)
+
+        with patch(
+            "backend.app.api.routes.tz.tz_repository.update",
+            new=AsyncMock(return_value=document),
+        ) as update:
+            response = asyncio.run(complete_document(TZCompleteRequest(
+                document=document,
+                company_id=company["company_id"],
+            )))
+
+        self.assertEqual(response.document.status, "ready")
+        self.assertEqual(response.document.ready_score, 100)
+        self.assertEqual(response.document.executor_name, company["company_name"])
+        self.assertEqual(
+            response.document.requisites["selected_contractor_id"],
+            company["company_id"],
+        )
+        update.assert_awaited_once()
+
     def test_validation_returns_actionable_3d_and_required_field_issues(self):
         template = tz_template_service.get_template("tz-ptd-reserves")
         document = tz_generator.new_document(

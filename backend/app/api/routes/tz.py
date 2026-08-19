@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from backend.app.core.config import settings
-from backend.app.models.domain import TZDocumentSection
+from backend.app.models.domain import TZDocument, TZDocumentSection
 
 from backend.app.schemas.tz import (
     TemplateDetailResponse,
@@ -15,23 +15,27 @@ from backend.app.schemas.tz import (
     TZChatHistoryResponse,
     TZChatSendRequest,
     TZChatSendResponse,
+    TZCompleteRequest,
     TZCreateRequest,
     TZDocumentResponse,
     TZDocumentSummary,
     TZGenerateRequest,
+    TZFeedbackRequest,
+    TZPreviewGenerateRequest,
     TZListResponse,
     TZTemplateSummary,
     TZSwitchTemplateRequest,
     TZValidationResult,
     TZUpdateRequest,
 )
-from backend.app.core.config import settings
 from backend.app.services.assistant import assistant_service
+from backend.app.services.assistant_context import collect_exceptional_conditions, enrich_assistant_context
 from backend.app.services.documents import document_export_service
 from backend.app.services.procurement import procurement_service
 from backend.app.services.tz_chat import tz_chat_service
 from backend.app.services.storage import DOCX_MIME, get_storage_service
 from backend.app.services.tz_generator import tz_generator
+from backend.app.services.tz_planning import sync_services
 from backend.app.services.tz_repository import tz_repository
 from backend.app.services.tz_templates import tz_template_service
 from backend.app.services.tz_validation import tz_validation_service
@@ -45,9 +49,33 @@ router = APIRouter()
 
 
 def _document_response(document) -> TZDocumentResponse:
+    sync_services(document, tz_template_service.get_or_default(document.template_key))
     validation = tz_validation_service.validate(document)
     document.ready_score = validation.ready_score
     return TZDocumentResponse(document=document, validation=validation)
+
+
+def _preview_document(payload: TZCreateRequest):
+    template = tz_template_service.get_template(payload.template_key)
+    if template is None:
+        raise HTTPException(status_code=404, detail="Шаблон не найден")
+    document = tz_generator.new_document(
+        template,
+        title=payload.title,
+        object_name=payload.object_name,
+        customer_name=payload.customer_name,
+        executor_name=payload.executor_name,
+        contract_name=payload.contract_name,
+        product_id=payload.product_id,
+        input_data=payload.input_data,
+        requisites=payload.requisites,
+    )
+    if payload.sections is not None:
+        document.sections = payload.sections
+    document.ai_initially_generated = payload.ai_initially_generated
+    if payload.auto_fill:
+        tz_generator.generate(document, mode="augment", template=template)
+    return document
 
 
 # --- Шаблоны ------------------------------------------------------------------
@@ -78,6 +106,92 @@ def get_template(key: str) -> TemplateDetailResponse:
     return TemplateDetailResponse(template=template)
 
 
+# --- Несохранённый конструктор ----------------------------------------------
+
+@router.post("/preview", response_model=TZDocumentResponse)
+def preview_document(payload: TZCreateRequest) -> TZDocumentResponse:
+    """Создаёт модель ТЗ для UI, не записывая её в БД."""
+    return _document_response(_preview_document(payload))
+
+
+@router.post("/preview/generate", response_model=TZDocumentResponse)
+async def generate_preview(payload: TZPreviewGenerateRequest) -> TZDocumentResponse:
+    document = payload.document.model_copy(deep=True)
+    template = tz_template_service.get_or_default(document.template_key)
+    conditions = collect_exceptional_conditions(
+        await tz_repository.list(),
+        " ".join(filter(None, [document.title, document.object_name, document.input_data.goal])),
+    )
+    tz_generator.generate(
+        document,
+        mode=payload.mode,
+        instruction=payload.instruction,
+        section_keys=payload.section_keys,
+        plan_only=payload.plan_only,
+        knowledge_conditions=conditions,
+        template=template,
+    )
+    return _document_response(document)
+
+
+@router.post("/preview/validate", response_model=TZValidationResult)
+def validate_preview(document: TZDocument) -> TZValidationResult:
+    return tz_validation_service.validate(document)
+
+
+@router.post("/complete", response_model=TZDocumentResponse)
+async def complete_document(payload: TZCompleteRequest) -> TZDocumentResponse:
+    """Фиксирует выбранного исполнителя и переводит полностью заполненное ТЗ в ready."""
+    document = payload.document.model_copy(deep=True)
+    analysis = procurement_service.estimate_for_tz(document, payload.additional_product_ids)
+    estimate = analysis.get("estimate") or {}
+    contractor = next(
+        (item for item in estimate.get("companies", []) if item["company_id"] == payload.company_id),
+        None,
+    )
+    if contractor is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Подрядчик больше не соответствует условиям ТЗ. Пересчитайте диаграмму Ганта.",
+        )
+
+    document.executor_name = contractor["company_name"]
+    document.contract_name = contractor.get("contract_number") or document.contract_name
+    document.requisites = {
+        **document.requisites,
+        "selected_contractor_id": contractor["company_id"],
+        "selected_contractor": {
+            "company_id": contractor["company_id"],
+            "company_name": contractor["company_name"],
+            "rating": contractor.get("rating"),
+            "contract_number": contractor.get("contract_number", ""),
+            "calc_id": contractor.get("calc_id", ""),
+            "estimated_days": contractor["estimated_days"],
+            "cost_without_vat": contractor["cost_without_vat"],
+            "cost_with_vat": contractor["cost_with_vat"],
+            "additional_product_ids": payload.additional_product_ids,
+            "selected_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+
+    validation = tz_validation_service.validate(document)
+    if not validation.valid or validation.ready_score < 100:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "ТЗ нужно заполнить на 100% до выбора исполнителя.",
+                "ready_score": validation.ready_score,
+                "issues": [issue.model_dump() for issue in validation.issues],
+            },
+        )
+
+    document.status = "ready"
+    document.ready_score = 100
+    document.updated_at = datetime.now(timezone.utc)
+    await tz_repository.update(document)
+    return TZDocumentResponse(document=document, validation=validation)
+
+
 # --- Документы ТЗ -------------------------------------------------------------
 
 @router.get("", response_model=TZListResponse)
@@ -94,6 +208,9 @@ async def list_documents() -> TZListResponse:
                 customer_name=d.customer_name,
                 status=d.status,
                 ready_score=d.ready_score,
+                executor_name=d.executor_name,
+                ai_initially_generated=d.ai_initially_generated,
+                feedback=d.feedback,
                 updated_at=d.updated_at.isoformat() if d.updated_at else None,
             )
             for d in documents
@@ -103,23 +220,7 @@ async def list_documents() -> TZListResponse:
 
 @router.post("", response_model=TZDocumentResponse)
 async def create_document(payload: TZCreateRequest) -> TZDocumentResponse:
-    template = tz_template_service.get_template(payload.template_key)
-    if template is None:
-        raise HTTPException(status_code=404, detail="Шаблон не найден")
-
-    document = tz_generator.new_document(
-        template,
-        title=payload.title,
-        object_name=payload.object_name,
-        customer_name=payload.customer_name,
-        executor_name=payload.executor_name,
-        contract_name=payload.contract_name,
-        product_id=payload.product_id,
-        input_data=payload.input_data,
-        requisites=payload.requisites,
-    )
-    if payload.auto_fill:
-        tz_generator.generate(document, mode="augment", template=template)
+    document = _preview_document(payload)
 
     await tz_repository.create(document)
     validation = tz_validation_service.validate(document)
@@ -152,8 +253,25 @@ async def update_document(doc_id: str, payload: TZUpdateRequest) -> TZDocumentRe
         document.requisites = {**document.requisites, **payload.requisites}
     if payload.sections is not None:
         document.sections = payload.sections
+    if payload.ai_initially_generated is not None:
+        document.ai_initially_generated = payload.ai_initially_generated
 
     document.ready_score = tz_validation_service.validate(document).ready_score
+    document.updated_at = datetime.now(timezone.utc)
+    await tz_repository.update(document)
+    return _document_response(document)
+
+
+@router.put("/{doc_id}/feedback", response_model=TZDocumentResponse)
+async def update_feedback(doc_id: str, payload: TZFeedbackRequest) -> TZDocumentResponse:
+    """Сохраняет оценки по завершённому ТЗ, не меняя его статус и содержимое."""
+    document = await tz_repository.get(doc_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="ТЗ не найдено")
+    if document.status != "ready":
+        raise HTTPException(status_code=422, detail="Оценки доступны только для готового ТЗ")
+    document.ai_initially_generated = payload.ai_initially_generated
+    document.feedback = payload.feedback
     document.updated_at = datetime.now(timezone.utc)
     await tz_repository.update(document)
     return _document_response(document)
@@ -174,11 +292,17 @@ async def generate_document(doc_id: str, payload: TZGenerateRequest) -> TZDocume
         raise HTTPException(status_code=404, detail="ТЗ не найдено")
 
     template = tz_template_service.get_or_default(document.template_key)
+    conditions = collect_exceptional_conditions(
+        await tz_repository.list(),
+        " ".join(filter(None, [document.title, document.object_name, document.input_data.goal])),
+    )
     tz_generator.generate(
         document,
         mode=payload.mode,
         instruction=payload.instruction,
         section_keys=payload.section_keys,
+        plan_only=payload.plan_only,
+        knowledge_conditions=conditions,
         template=template,
     )
     validation = tz_validation_service.validate(document)
@@ -224,12 +348,14 @@ async def switch_document_template(doc_id: str, payload: TZSwitchTemplateRequest
         raise HTTPException(status_code=404, detail="Шаблон не найден")
 
     previous = {section.key: section for section in document.sections}
+    template_keys = {section.key for section in template.sections}
+    custom_sections = [section for section in document.sections if section.key.startswith("custom-") and section.key not in template_keys]
     document.sections = [
         previous.get(section.key) or TZDocumentSection(
             key=section.key, title=section.title, content="", source="template"
         )
         for section in template.sections
-    ]
+    ] + custom_sections
     for section in document.sections:
         template_section = next((s for s in template.sections if s.key == section.key), None)
         if template_section:
@@ -281,16 +407,7 @@ async def export_document(doc_id: str) -> FileResponse:
 
 def _chat_context(document, validation, extra: dict | None) -> dict:
     context = {
-        "tz": {
-            "id": document.id,
-            "template_name": document.template_name,
-            "ready_score": document.ready_score,
-            "object_name": document.object_name,
-            "customer_name": document.customer_name,
-            "executor_name": document.executor_name,
-            "goal": document.input_data.goal,
-            "deadline": document.input_data.deadline,
-        },
+        "tz": document.model_dump(mode="json"),
         "validation_issues": [i.model_dump() for i in validation.issues],
         "empty_sections": [s.title for s in document.sections if not s.content.strip()],
     }
@@ -322,9 +439,12 @@ async def post_chat(doc_id: str, payload: TZChatSendRequest) -> TZChatSendRespon
     history = [(m.role, m.text) for m in document.chat]
 
     document.chat.append(tz_chat_service.make_message("user", payload.message))
+    context = await enrich_assistant_context(
+        payload.message, _chat_context(document, validation, payload.context)
+    )
     reply, provider, fallback = assistant_service.generate(
         message=payload.message,
-        context=_chat_context(document, validation, payload.context),
+        context=context,
         history=history,
         allowed_fields=allowed,
     )
@@ -347,6 +467,7 @@ async def post_chat(doc_id: str, payload: TZChatSendRequest) -> TZChatSendRespon
         model=settings.llm_model if provider == "deepseek" else None,
         fallback=fallback,
         validation=validation,
+        discovery=context.get("discovery"),
     )
 
 

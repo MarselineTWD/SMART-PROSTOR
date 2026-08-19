@@ -14,7 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.core.db import SessionLocal
 from backend.app.models.db import TZDocumentORM
-from backend.app.models.domain import TZChatMessage, TZDocument, TZDocumentSection
+from backend.app.models.domain import TZChatMessage, TZDocument, TZDocumentSection, TZFeedback
 
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,8 @@ def _to_columns(doc: TZDocument) -> dict:
         "sections": [s.model_dump() for s in doc.sections],
         "notes": doc.notes,
         "chat": [m.model_dump(mode="json") for m in doc.chat],
+        "ai_initially_generated": doc.ai_initially_generated,
+        "feedback": doc.feedback.model_dump(),
         "storage_key": doc.storage_key,
         "created_at": doc.created_at,
         "updated_at": doc.updated_at,
@@ -66,6 +68,8 @@ def _from_orm(row: TZDocumentORM) -> TZDocument:
         sections=[TZDocumentSection(**s) for s in (row.sections or [])],
         notes=row.notes or [],
         chat=[TZChatMessage(**m) for m in (getattr(row, "chat", None) or [])],
+        ai_initially_generated=bool(getattr(row, "ai_initially_generated", False)),
+        feedback=TZFeedback(**(getattr(row, "feedback", None) or {})),
         storage_key=row.storage_key,
         created_at=row.created_at,
         updated_at=row.updated_at,

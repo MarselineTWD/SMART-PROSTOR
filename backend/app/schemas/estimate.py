@@ -27,6 +27,13 @@ class AdditionalServiceCost(BaseModel):
     team: list[TeamMember] = []
 
 
+class CostFactor(BaseModel):
+    key: str
+    label: str
+    multiplier: float
+    reason: str
+
+
 class RoadmapStage(BaseModel):
     order: int
     name: str
@@ -38,6 +45,9 @@ class RoadmapStage(BaseModel):
     start_date: str | None = None
     end_date: str | None = None
     estimated_cost_without_vat: float = 0
+    kind: str = "work"
+    delay_reason: str = ""
+    billable_percent: float = 0
 
 
 class ContractorEstimate(BaseModel):
@@ -72,10 +82,23 @@ class ContractorEstimate(BaseModel):
     base_cost_without_vat: float
     additional_cost_without_vat: float = 0
     additional_services: list[AdditionalServiceCost] = []
+    location: str = "Не указано"
+    location_factor: float = 1.0
+    project_multiplier: float = 1.0
+    cost_factors: list[CostFactor] = []
+    suitability_score: int = 0
+    selection_reasons: list[str] = []
+
+
+class ExcludedContractor(BaseModel):
+    company_id: str
+    company_name: str
+    reasons: list[str] = []
 
 
 class EstimateSummary(BaseModel):
     company_count: int
+    excluded_company_count: int = 0
     fastest_days: int
     slowest_days: int
     average_days: int
@@ -86,6 +109,9 @@ class EstimateSummary(BaseModel):
     lowest_cost_company: str
     vat_rate: float
     cost_disclaimer: str
+    location: str = "Не указано"
+    selection_criteria: list[str] = []
+    pricing_criteria: list[str] = []
 
 
 class ProductEstimateResponse(BaseModel):
@@ -94,6 +120,7 @@ class ProductEstimateResponse(BaseModel):
     operations: list[str] = []
     roles: list[str] = []
     companies: list[ContractorEstimate] = []
+    excluded_contractors: list[ExcludedContractor] = []
     summary: EstimateSummary
     available_additional_services: list[AdditionalServiceOption] = []
     selected_additional_product_ids: list[str] = []
