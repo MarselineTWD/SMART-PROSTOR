@@ -728,7 +728,7 @@ export default function App() {
 
       <main className={`app-shell ${isChatOpen ? "chat-open" : "chat-closed"}`}>
       <section className="workspace">
-        <header className="topbar">
+        <header className={`topbar topbar-${activeTab}`}>
           <div>
             <span className="eyebrow">ПРОСТОР · единый рабочий процесс</span>
             <h2>{titles[activeTab]}</h2>
@@ -1436,7 +1436,10 @@ function AnalyticsView({ analytics, contractorAnalytics }) {
 
       <div className="analytics-main-grid">
         <section className="panel analytics-chart"><div className="analytics-title"><div><span className="eyebrow">СПРОС</span><h4>Популярные виды работ</h4></div><small>Последние 90 дней</small></div><div className="horizontal-bars">{productBars.map((item,index)=><div key={item.label}><span><b>{index+1}</b>{item.label}<em>{item.value}%</em></span><i><em style={{width:`${item.value}%`}} /></i></div>)}</div></section>
-        <section className="panel coverage-card"><div className="analytics-title"><div><span className="eyebrow">ДАННЫЕ</span><h4>Покрытие базы ПРОСТОР</h4></div><span className="live-label"><i/>Live</span></div><div className="coverage-list">{coverageRows.map(([label,value,max])=><div key={label}><span><b>{label}</b><em>{value.toLocaleString('ru-RU')}</em></span><i><em style={{width:`${Math.min(100,value/max*100)}%`}} /></i></div>)}</div></section>
+        <section className="panel contractor-leaderboard compact-leaderboard">
+          <div className="analytics-title"><div><span className="eyebrow">ПОДРЯДЧИКИ</span><h4>Рейтинг подрядчиков</h4></div><small>{contractorAnalytics?.summary?.total_contractors ? `${contractorAnalytics.summary.total_contractors} компаний` : "ПРОСТОР"}</small></div>
+          {contractorRanking.length ? <div className="contractor-ranking-list">{contractorRanking.map((company,index)=>{const rating=Number(company.rating ?? company.value ?? 0);return <article className={index<3?'top-contractor':''} key={company.company_id}><span className={'rank-place place-'+(index+1)}>{index+1}</span><div><b>{company.company_name}</b><small>{index===0?'Лидер рейтинга':index<3?'Входит в топ-3':'Проверенный подрядчик'}</small></div><span className="rating-stars" aria-label={`Рейтинг ${rating.toFixed(1)} из 5`}><i style={{width:`${Math.min(100,rating/5*100)}%`}}>★★★★★</i><em>★★★★★</em></span><strong>{rating.toFixed(1)}</strong></article>})}</div>:<div className="contractor-ranking-empty">Рейтинг появится после загрузки данных</div>}
+        </section>
       </div>
 
       <div className="analytics-lower-grid">
@@ -1444,15 +1447,7 @@ function AnalyticsView({ analytics, contractorAnalytics }) {
         <section className="panel analytics-risks"><div className="analytics-title"><div><span className="eyebrow">КАЧЕСТВО</span><h4>Что чаще всего нужно уточнить</h4></div></div><ol>{(analytics.typical_request_errors || analytics.common_risk_patterns || []).slice(0,4).map((item,index)=><li key={item}><span>{index+1}</span><b>{item}</b></li>)}</ol></section>
       </div>
 
-      <section className="panel contractor-leaderboard">
-        <div className="analytics-title"><div><span className="eyebrow">ПОДРЯДЧИКИ</span><h4>Рейтинг подрядчиков</h4></div><small>{contractorAnalytics?.summary?.total_contractors ? `${contractorAnalytics.summary.total_contractors} компаний в базе` : "По данным ПРОСТОР"}</small></div>
-        {contractorRanking.length ? <div className="contractor-ranking-list">{contractorRanking.map((company,index)=>{
-          const rating=Number(company.rating ?? company.value ?? 0);
-          return <article className={index<3?'top-contractor':''} key={company.company_id}><span className={'rank-place place-'+(index+1)}>{index+1}</span><div><b>{company.company_name}</b><small>{index===0?'Лидер рейтинга':index<3?'Входит в топ-3':'Проверенный подрядчик'}</small></div><span className="rating-stars" aria-label={`Рейтинг ${rating.toFixed(1)} из 5`}><i style={{width:`${Math.min(100,rating/5*100)}%`}}>★★★★★</i><em>★★★★★</em></span><strong>{rating.toFixed(1)}</strong></article>;
-        })}</div> : <div className="contractor-ranking-empty">Рейтинг появится после загрузки данных подрядчиков</div>}
-      </section>
-
-      <section className="panel analytics-insight"><span className="insight-icon"><Sparkles size={22}/></span><div><span className="eyebrow">AI-ИНСАЙТ</span><h4>Точка роста продуктового каталога</h4><p>{analytics.product_packaging_candidates?.[0] || 'Объедините наиболее востребованные услуги в готовый пакет.'}</p></div><div className="insight-tags">{(analytics.most_requested_products || []).slice(0,3).map(item=><span key={item}>{item}</span>)}</div></section>
+      <section className="panel coverage-card full-coverage"><div className="analytics-title"><div><span className="eyebrow">ДАННЫЕ</span><h4>Покрытие базы ПРОСТОР</h4></div><span className="live-label"><i/>Live</span></div><div className="coverage-list">{coverageRows.map(([label,value,max])=><div key={label}><span><b>{label}</b><em>{value.toLocaleString('ru-RU')}</em></span><i><em style={{width:`${Math.min(100,value/max*100)}%`}} /></i></div>)}</div></section>
     </div>
   );
 }
